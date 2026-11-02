@@ -81,6 +81,7 @@ If the CLI is missing, Respire shows a notice at startup and in settings instead
 - **Provider traffic** — your prompts, attachments, and tool output go to the provider you select (Anthropic, OpenAI, xAI, OpenCode-configured providers, and so on). That traffic is governed by that provider's terms.
 - **Memory traffic** — when memory is enabled, the prompt and reply for a turn are passed to the local `rsrs` CLI for recall and storage. rsrs keeps its data in a local encrypted store; any sync is performed by rsrs under your own configuration. The plugin does not send memory data to risense-ai servers.
 - **Redaction** — common secret shapes (private-key blocks, bearer tokens, and several API-key formats) are scrubbed before text is sent to rsrs. Redaction is best-effort; do not paste secrets into chats.
+- **Local CLI access** — to launch providers, discover models, and import sessions, Respire reads provider CLI configuration and session files outside the vault (for example under `~/.claude`, `~/.codex`, or the OpenCode data directory) and runs those CLIs as child processes. It only reads what the selected provider needs.
 - **No telemetry** — the plugin does not include analytics or telemetry beacons.
 - **Local listener** — some providers use a loopback-only (`127.0.0.1`) listener for session tools.
 
