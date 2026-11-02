@@ -1,0 +1,69 @@
+import type { App } from 'obsidian';
+
+import type { ProviderHostStorage } from '../bootstrap/storage';
+import type {
+  ProviderExecutionLifecycleRegistry,
+  ProviderExecutionTransitionScope,
+} from '../execution';
+import type { SessionToolEndpoint } from '../session-tools/SessionToolEndpoint';
+import type { ClaudianSettings } from '../types';
+import type { EnvironmentScope } from '../types/settings';
+import type { ProviderRuntimeHost } from './ProviderRuntimeHost';
+import type { ProviderCLIResolutionContext, ProviderId } from './types';
+
+/**
+ * Application capabilities available to provider adapters.
+ *
+ * The host deliberately excludes plugin lifecycle, command registration, and
+ * conversation ownership. Providers receive only the settings, environment,
+ * path, CLI, storage, and interaction capabilities they currently consume.
+ */
+export interface ProviderHost {
+  readonly app: App;
+  readonly executionLifecycleRegistry: ProviderExecutionLifecycleRegistry;
+  readonly settings: Readonly<ClaudianSettings>;
+  readonly storage: ProviderHostStorage;
+  readonly manifest?: { version?: string };
+  /** Absolute local directory provider processes run in; null when the host has no local directory. */
+  readonly workingDirectory: string | null;
+  /** Loopback endpoint through which shared provider processes reach main-chat session tools. */
+  readonly sessionToolEndpoint: SessionToolEndpoint;
+
+  mutateSettings(
+    mutation: (settings: ClaudianSettings) => void | Promise<void>,
+  ): Promise<void>;
+  /** Returning false discards the draft: nothing is committed, persisted, or published. */
+  mutateSettingsConditionally(
+    mutation: (settings: ClaudianSettings) => boolean | Promise<boolean>,
+  ): Promise<void>;
+
+  getActiveEnvironmentVariables(providerId: ProviderId): string;
+  getEnvironmentVariablesForScope(scope: EnvironmentScope): string;
+  applyEnvironmentVariables(scope: EnvironmentScope, envText: string): Promise<void>;
+  applyEnvironmentVariablesBatch(
+    updates: Array<{ scope: EnvironmentScope; envText: string }>,
+  ): Promise<void>;
+  /**
+   * Persists runtime inputs, their reconciled fingerprints, and any durable
+   * session-invalidation marker in one settings transaction.
+   */
+  applyProviderRuntimeSettings(
+    providerIds: ProviderId[],
+    mutation: (settings: ClaudianSettings) => void | Promise<void>,
+    onApplied?: () => void | Promise<void>,
+  ): Promise<void>;
+  getResolvedProviderCliPath(
+    providerId: ProviderId,
+    context?: ProviderCLIResolutionContext,
+  ): Promise<string | null>;
+  runProviderExecutionTransition<T>(
+    providerIds: ProviderId[],
+    mutation: (scope: ProviderExecutionTransitionScope) => Promise<T>,
+    parentScope?: ProviderExecutionTransitionScope,
+  ): Promise<T>;
+
+  notifyProviderChatOptionsChanged(providerId: ProviderId): void;
+
+  /** The provider-scoped view handed to that provider's runtime code. */
+  getRuntimeHost(providerId: ProviderId): ProviderRuntimeHost;
+}

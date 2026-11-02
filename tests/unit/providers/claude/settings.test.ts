@@ -1,0 +1,76 @@
+import { getInstallationKey } from '@/core/device/InstallationKey';
+import { claudeProviderRegistration } from '@/providers/claude/registration';
+import { getClaudeProviderSettings, updateClaudeProviderSettings } from '@/providers/claude/settings';
+
+describe('Claude settings normalization', () => {
+  it('projects and updates installation settings by durable installation key', () => {
+    const platform = process.platform;
+    Object.defineProperty(process, 'platform', { value: 'win32' });
+    try {
+      const key = getInstallationKey();
+      const settings = { providerConfigs: { claude: {
+        installationMethodsByHost: { [key]: 'wsl', other: 'native-windows' },
+        wslDistroOverridesByHost: { [key]: 'Ubuntu', other: 'Debian' },
+      } } };
+      expect(getClaudeProviderSettings(settings)).toMatchObject({ installationMethod: 'wsl', wslDistroOverride: 'Ubuntu' });
+      updateClaudeProviderSettings(settings, { wslDistroOverride: ' Fedora ' });
+      expect(settings.providerConfigs.claude.wslDistroOverridesByHost).toEqual({ [key]: 'Fedora', other: 'Debian' });
+      expect(settings.providerConfigs.claude).not.toHaveProperty('wslDistroOverride');
+    } finally { Object.defineProperty(process, 'platform', { value: platform }); }
+  });
+
+  it.each([undefined, null, 'true', 1, false, true])('decodes opt-in prompt suggestions from %o', value => {
+    const settings = { providerConfigs: { claude: { promptSuggestions: value } } };
+    expect(getClaudeProviderSettings(settings).promptSuggestions).toBe(value === true);
+  });
+
+  it.each(['default', 'My Style', null] as const)('persists the %o output style while preserving other settings', (outputStyle) => {
+    const settings = { providerConfigs: { claude: { customModels: 'custom' } } };
+    updateClaudeProviderSettings(settings, { outputStyle });
+    expect(getClaudeProviderSettings(settings)).toMatchObject({ outputStyle });
+    expect(settings.providerConfigs.claude.customModels).toBe('custom');
+  });
+
+  it.each([
+    [{ responseStyle: 'Concise' }, 'Concise'],
+    [{ responseStyle: 'Default' }, null],
+    [{}, null],
+    [{ outputStyle: '', responseStyle: 'Concise' }, 'Concise'],
+    [{ outputStyle: null, responseStyle: 'Concise' }, null],
+    [{ outputStyle: ' Explanatory ' }, 'Explanatory'],
+    [{ outputStyle: 42 }, null],
+  ])('reads stored style %o as %o', (config, outputStyle) => {
+    expect(getClaudeProviderSettings({ providerConfigs: { claude: config } })).toMatchObject({ outputStyle });
+  });
+
+  it('drops the retired response style when stored settings are normalized', () => {
+    const target: Record<string, unknown> = {};
+    const stored = { providerConfigs: { claude: { responseStyle: 'Concise' } } };
+    expect(claudeProviderRegistration.settingsStorage!.normalizeStored!(target, stored)).toBe(true);
+    const config = (target.providerConfigs as Record<string, Record<string, unknown>>).claude;
+    expect(config).toMatchObject({ outputStyle: 'Concise' });
+    expect(config).not.toHaveProperty('responseStyle');
+  });
+
+  it('normalizes mixed CLI maps without interpreting host-shaped keys', () => {
+    expect(getClaudeProviderSettings({
+      providerConfigs: {
+        claude: {
+          cliPathsByHost: {
+            ' legacy-host ': ' /legacy/claude ',
+            invalid: 42,
+            empty: '',
+          },
+        },
+      },
+    }).cliPathsByHost).toEqual({
+      'legacy-host': '/legacy/claude',
+    });
+  });
+
+  it('rejects arrays as CLI maps', () => {
+    expect(getClaudeProviderSettings({
+      providerConfigs: { claude: { cliPathsByHost: ['/array/claude'] } },
+    }).cliPathsByHost).toEqual({});
+  });
+});

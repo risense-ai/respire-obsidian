@@ -1,0 +1,126 @@
+import * as fs from 'fs';
+import * as path from 'path';
+import type { Mock } from 'vitest';
+
+import { getInstallationKey } from '@/core/device/InstallationKey';
+import { OpencodeCLIResolver } from '@/providers/opencode/runtime/OpencodeCLIResolver';
+
+vi.mock('fs');
+const mockedStat = fs.statSync as Mock;
+
+describe('OpencodeCLIResolver', () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+    (fs.existsSync as Mock).mockReturnValue(false);
+  });
+
+  it('uses the current host path instead of another synced host path', () => {
+    mockedStat.mockImplementation((filePath: string) => {
+      if (filePath === '/current/opencode') {
+        return { isFile: () => true };
+      }
+      throw new Error(`ENOENT: ${filePath}`);
+    });
+
+    const resolver = new OpencodeCLIResolver();
+    const resolved = resolver.resolveFromSettings({
+      providerConfigs: { opencode: {
+        cliPathsByHost: {
+          'other-host': '/other/opencode',
+          [getInstallationKey()]: '/current/opencode',
+        },
+        cliPath: '/legacy/opencode',
+      } },
+    });
+
+    expect(resolved).toBe('/current/opencode');
+  });
+
+  it('falls back to the legacy path when the current host has no custom path', () => {
+    mockedStat.mockImplementation((filePath: string) => {
+      if (filePath === '/legacy/opencode') {
+        return { isFile: () => true };
+      }
+      throw new Error(`ENOENT: ${filePath}`);
+    });
+
+    const resolver = new OpencodeCLIResolver();
+    const resolved = resolver.resolveFromSettings({
+      providerConfigs: { opencode: {
+        cliPathsByHost: { 'other-host': '/other/opencode' },
+        cliPath: '/legacy/opencode',
+      } },
+    });
+
+    expect(resolved).toBe('/legacy/opencode');
+  });
+
+  it('returns null when neither the current host nor the legacy path resolve to a file', () => {
+    mockedStat.mockImplementation(() => {
+      throw new Error('ENOENT');
+    });
+
+    const resolver = new OpencodeCLIResolver();
+    const resolved = resolver.resolveFromSettings({
+      providerConfigs: { opencode: {
+        cliPathsByHost: { 'other-host': '/other/opencode' },
+        cliPath: '/legacy/opencode',
+      } },
+    });
+
+    expect(resolved).toBeNull();
+  });
+
+  it('falls back to PATH lookup when no OpenCode CLI path is configured', () => {
+    const pathDir = '/custom/bin';
+    const pathBinary = path.join(pathDir, 'opencode');
+    mockedStat.mockImplementation((filePath: string) => {
+      if (filePath === pathBinary) {
+        return { isFile: () => true };
+      }
+      throw new Error(`ENOENT: ${filePath}`);
+    });
+
+    const resolver = new OpencodeCLIResolver();
+    const resolved = resolver.resolveFromSettings({
+      providerConfigs: { opencode: { environmentVariables: `PATH=${pathDir}` } },
+    });
+
+    expect(resolved).toBe(pathBinary);
+  });
+
+  it('caches null settings resolutions until reset', () => {
+    mockedStat.mockImplementation(() => {
+      throw new Error('ENOENT');
+    });
+    const resolver = new OpencodeCLIResolver();
+    const settings = { providerConfigs: { opencode: {} } };
+
+    expect(resolver.resolveFromSettings(settings)).toBeNull();
+    const firstCallCount = mockedStat.mock.calls.length;
+    expect(firstCallCount).toBeGreaterThan(0);
+    expect(resolver.resolveFromSettings(settings)).toBeNull();
+    expect(mockedStat).toHaveBeenCalledTimes(firstCallCount);
+
+    resolver.reset();
+    expect(resolver.resolveFromSettings(settings)).toBeNull();
+    expect(mockedStat.mock.calls.length).toBeGreaterThan(firstCallCount);
+  });
+});
+
+it('uses Linux command references without touching host files for a Windows WSL installation', () => {
+  const platform = Object.getOwnPropertyDescriptor(process, 'platform')!;
+  Object.defineProperty(process, 'platform', { ...platform, value: 'win32' });
+  try {
+    mockedStat.mockClear();
+    const resolver = new OpencodeCLIResolver();
+    const key = getInstallationKey();
+    const config = { installationMethodsByHost: { [key]: 'wsl' }, cliPathsByHost: { [key]: '/home/alice/bin/open code' } };
+    expect(resolver.resolveFromSettings({ providerConfigs: { opencode: config } })).toBe('/home/alice/bin/open code');
+    // A stored legacy path keeps pasted whitespace and quotes; neither reaches the Linux command.
+    expect(resolver.resolveFromSettings({ providerConfigs: { opencode: { installationMethodsByHost: { [key]: 'wsl' }, cliPath: '  "/home/alice/bin/legacy"  ' } } })).toBe('/home/alice/bin/legacy');
+    config.cliPathsByHost[key] = 'C:\\Tools\\opencode.cmd';
+    expect(resolver.resolveFromSettings({ providerConfigs: { opencode: config } })).toBe('opencode');
+    expect(mockedStat).not.toHaveBeenCalled();
+  } finally { Object.defineProperty(process, 'platform', platform); }
+});

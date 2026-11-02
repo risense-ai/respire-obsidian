@@ -1,0 +1,409 @@
+/*
+ * Input toolbar: one row of native chip buttons whose menus open on click.
+ * Shared chip and menu styles live here; each control's file adds its own modifiers.
+ */
+.claudian-input-toolbar {
+  display: flex;
+  flex-shrink: 0;
+  flex-wrap: nowrap;
+  align-items: center;
+  gap: 2px;
+  min-width: 0;
+  padding: 4px 6px 6px;
+}
+
+/* Narrow composers keep the model name and drop reasoning and fast-mode details (input box container). */
+@container (max-width: 300px) {
+  .claudian-toolbar-chip .claudian-toolbar-chip-secondary {
+    display: none;
+  }
+}
+
+/* Each menu is placed and sized against its own button. */
+.claudian-toolbar-chip-anchor {
+  position: relative;
+  display: flex;
+  flex: 0 0 auto;
+  min-width: 0;
+}
+
+/* Only the model chip gives up width; its name truncates first. */
+.claudian-toolbar-chip-anchor--model {
+  flex: 0 1 auto;
+}
+
+.claudian-input-toolbar button.claudian-toolbar-chip,
+.claudian-input-toolbar button.claudian-toolbar-chip:is(:hover, :focus, :focus-visible, :active) {
+  /* The button already shows its value, so Obsidian's aria-label hover tooltip would only repeat it. */
+  --no-tooltip: true;
+
+  appearance: none;
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  min-width: 0;
+  height: 24px;
+  overflow: hidden;
+  padding: 0 7px;
+  border: 0;
+  border-radius: 6px;
+  background: transparent;
+  box-shadow: none;
+  color: var(--text-muted);
+  font-size: 12px;
+  font-weight: normal;
+  white-space: nowrap;
+  cursor: pointer;
+}
+
+/* Chips brighten their text on hover, focus and while open; they take no fill. */
+.claudian-input-toolbar button.claudian-toolbar-chip:is(:hover, :focus-visible, [aria-expanded='true']) {
+  color: var(--text-normal);
+}
+
+.claudian-input-toolbar button.claudian-toolbar-chip:focus-visible {
+  outline: 2px solid var(--interactive-accent);
+  outline-offset: 1px;
+}
+
+.claudian-toolbar-chip-primary {
+  min-width: 0;
+  overflow: hidden;
+  color: var(--text-normal);
+  font-weight: 500;
+  text-overflow: ellipsis;
+}
+
+.claudian-toolbar-chip-secondary {
+  flex: 0 0 auto;
+}
+
+.claudian-toolbar-chip-icon,
+.claudian-toolbar-chip-chevron {
+  display: flex;
+  flex: 0 0 auto;
+  align-items: center;
+}
+
+.claudian-toolbar-chip-icon:empty {
+  display: none;
+}
+
+.claudian-toolbar-chip-icon svg {
+  width: 12px;
+  height: 12px;
+}
+
+.claudian-toolbar-chip-chevron svg {
+  width: 12px;
+  height: 12px;
+  opacity: 0.6;
+}
+
+/* The chevron points up while its menu is open above the button. */
+.claudian-toolbar-chip[aria-expanded='true']:not([data-menu-placement='below']) .claudian-toolbar-chip-chevron {
+  transform: rotate(180deg);
+}
+
+/*
+ * Menu surface, opening above its button from the button's start edge. It fits its longest
+ * row: never narrower than the button, never wider than the input box.
+ */
+.claudian-toolbar-popover {
+  /* The surface's own aria-label would otherwise pop up as a tooltip over every control inside it. */
+  --no-tooltip: true;
+
+  position: absolute;
+
+  /* Clears the toolbar's top padding, then a 4px gap. */
+  bottom: calc(100% + 8px);
+  inset-inline-start: 0;
+  z-index: 1000;
+  display: flex;
+  flex-direction: column;
+  box-sizing: border-box;
+  width: max-content;
+  min-width: 100%;
+  max-width: min(280px, calc(100cqi - 12px));
+  max-height: min(420px, 60vh);
+  overflow-y: auto;
+  padding: 4px;
+  border: 1px solid var(--background-modifier-border-hover);
+  border-radius: 8px;
+
+  /* Secondary stays opaque when translucent themes clear the primary background. */
+  background-color: var(--background-secondary);
+}
+
+
+/* Floating menus choose the side with room and stay within the viewport's vertical edges. */
+.claudian-toolbar-popover.claudian-toolbar-popover--floating {
+  position: fixed;
+  top: var(--claudian-toolbar-popover-top, auto);
+  bottom: var(--claudian-toolbar-popover-bottom);
+  max-height: min(var(--claudian-toolbar-popover-max-height, 420px), 60vh);
+  inset-inline-start: auto;
+  right: var(--claudian-toolbar-popover-right);
+  min-width: var(--claudian-toolbar-popover-min-width);
+  max-width: 280px;
+}
+
+.claudian-toolbar-popover[hidden] {
+  display: none;
+}
+
+.claudian-toolbar-popover-section + .claudian-toolbar-popover-section,
+.claudian-toolbar-popover-group + .claudian-toolbar-popover-group {
+  margin-top: 4px;
+  padding-top: 4px;
+  border-top: 1px solid var(--background-modifier-border);
+}
+
+.claudian-toolbar-popover-heading {
+  padding: 6px 8px 3px;
+  color: var(--text-faint);
+  font-size: 10px;
+  font-weight: 600;
+  letter-spacing: 0.05em;
+  text-transform: uppercase;
+}
+
+.claudian-toolbar-popover-empty {
+  padding: 6px 8px;
+  color: var(--text-muted);
+  font-size: 12px;
+}
+
+.claudian-toolbar-popover button.claudian-toolbar-popover-option,
+.claudian-toolbar-popover button.claudian-toolbar-popover-option:is(:hover, :focus, :focus-visible, :active) {
+  appearance: none;
+  display: flex;
+  align-items: center;
+  gap: 7px;
+  width: 100%;
+  height: auto;
+  min-height: 26px;
+  padding: 4px 8px;
+  border: 0;
+  border-radius: 5px;
+  background: transparent;
+  box-shadow: none;
+  color: var(--text-normal);
+  font-size: 12px;
+  font-weight: normal;
+  text-align: start;
+  cursor: pointer;
+}
+
+.claudian-toolbar-popover button.claudian-toolbar-popover-option:is(:hover, :focus-visible) {
+  background: var(--background-modifier-hover);
+}
+
+/* Every provider icon carries that provider's logo colour; names stay normal text. */
+.claudian-toolbar-chip .claudian-model-provider-icon,
+.claudian-model-provider-tab .claudian-model-provider-icon {
+  color: var(--claudian-provider-logo);
+}
+
+/* Hover and focus share a fill, so keyboard focus also needs an outline. */
+.claudian-toolbar-popover button.claudian-toolbar-popover-option:focus-visible {
+  outline: 2px solid var(--interactive-accent);
+  outline-offset: -2px;
+}
+
+.claudian-toolbar-popover-option-label {
+  flex: 1 1 auto;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.claudian-toolbar-popover-option-copy {
+  display: flex;
+  flex: 1 1 auto;
+  flex-direction: column;
+  gap: 1px;
+  min-width: 0;
+}
+
+.claudian-toolbar-popover-option-detail {
+  color: var(--text-muted);
+  font-size: 11px;
+  line-height: 1.3;
+}
+
+.claudian-toolbar-popover-option-icon,
+.claudian-toolbar-popover-option-check {
+  display: flex;
+  flex: 0 0 auto;
+  align-items: center;
+}
+
+.claudian-toolbar-popover-option-icon svg,
+.claudian-toolbar-popover-option-check svg {
+  width: 13px;
+  height: 13px;
+}
+
+/* Only the tick marks the current choice; the row keeps a plain surface. */
+.claudian-toolbar-popover-option-check {
+  color: var(--claudian-selection-check);
+}
+
+.claudian-model-provider-icon {
+  flex-shrink: 0;
+}
+
+/*
+ * Model popover: columns side by side (providers, models, then reasoning and fast mode), each
+ * scrolling on its own. Its size is fixed, so browsing providers or models never reshapes it:
+ * the height fits the model heading and four models with a one-line description, and longer
+ * lists scroll. Fixed line heights keep that sum exact under any theme.
+ */
+.claudian-toolbar-popover.claudian-model-popover {
+  --claudian-model-provider-tab-size: 28px;
+  --claudian-model-provider-gap: 2px;
+  --claudian-model-heading-height: calc(4px + 13px + 6px);
+  --claudian-model-row-height: calc(4px + 16px + 1px + 14px + 4px);
+
+  flex-direction: row;
+  align-items: stretch;
+  height: min(
+    calc(var(--claudian-model-heading-height) + 4 * var(--claudian-model-row-height) + 2px + 12px + 2px),
+    60vh
+  );
+  max-width: calc(100cqi - 12px);
+  overflow: hidden;
+  padding: 6px;
+  border-radius: 12px;
+}
+
+.claudian-toolbar-popover.claudian-model-popover.claudian-toolbar-popover--floating {
+  max-width: min(560px, calc(100vw - 24px));
+}
+
+.claudian-model-column {
+  display: flex;
+  flex-direction: column;
+  min-width: 0;
+  min-height: 0;
+  overflow-y: auto;
+  padding: 0 6px 2px;
+}
+
+.claudian-model-column .claudian-toolbar-popover-heading {
+  padding-top: 4px;
+  padding-bottom: 6px;
+  line-height: 13px;
+}
+
+/* Upstream groups in the model list are set apart by their headings alone, with no divider. */
+.claudian-model-list > .claudian-toolbar-popover-group + .claudian-toolbar-popover-group {
+  margin-top: 4px;
+  padding-top: 0;
+  border-top: 0;
+}
+
+/*
+ * A sub-heading sits close to the models under it, compact enough that three groups holding four
+ * undescribed models fit the popover's fixed height.
+ */
+.claudian-model-list .claudian-model-group {
+  padding-top: 1px;
+  padding-bottom: 0;
+}
+
+.claudian-model-providers {
+  flex: 0 0 auto;
+  align-items: center;
+  justify-content: flex-start;
+  gap: var(--claudian-model-provider-gap);
+
+  /* Icons stack from the top of the column. */
+  padding: 0 8px 2px;
+  border-inline-end: 1px solid var(--background-modifier-border);
+}
+
+.claudian-model-options {
+  flex: 0 1 220px;
+  width: 220px;
+}
+
+.claudian-model-parts {
+  flex: 0 0 116px;
+  width: 116px;
+  transition: opacity 0.15s ease;
+  border-inline-start: 1px solid var(--background-modifier-border);
+}
+
+/* While another provider is browsed, the current model's settings fade and cannot be changed. */
+.claudian-model-parts--inert {
+  opacity: 0.45;
+}
+
+/* The columns' own sections stack without the menu's separators. */
+.claudian-model-parts > .claudian-toolbar-popover-section + .claudian-toolbar-popover-section {
+  margin-top: 0;
+  border-top: 0;
+}
+
+.claudian-toolbar-popover button.claudian-toolbar-popover-option {
+  border-radius: 7px;
+}
+
+.claudian-model-option .claudian-toolbar-popover-option-label {
+  font-weight: 500;
+  line-height: 16px;
+}
+
+/* A description wraps to two lines at most; its full text stays in the row's tooltip. */
+.claudian-model-option .claudian-toolbar-popover-option-detail {
+  display: -webkit-box;
+  overflow: hidden;
+  -webkit-box-orient: vertical;
+  -webkit-line-clamp: 2;
+  line-clamp: 2;
+  line-height: 14px;
+}
+
+/* Provider tabs: a bare icon each with no fill; the browsed provider is at full strength with a bar in its colour. */
+.claudian-toolbar-popover button.claudian-model-provider-tab,
+.claudian-toolbar-popover button.claudian-model-provider-tab:is(:hover, :focus, :focus-visible, :active) {
+  position: relative;
+  justify-content: center;
+  flex: 0 0 auto;
+  width: auto;
+  height: var(--claudian-model-provider-tab-size);
+  min-height: var(--claudian-model-provider-tab-size);
+  margin: 0;
+  padding: 0;
+  background: transparent;
+  opacity: 0.5;
+}
+
+.claudian-toolbar-popover button.claudian-model-provider-tab:is(:hover, :focus-visible, [aria-selected='true']) {
+  opacity: 1;
+}
+
+.claudian-model-provider-tile {
+  display: grid;
+  place-items: center;
+  color: var(--claudian-provider-logo);
+}
+
+.claudian-model-provider-tile svg {
+  width: 13px;
+  height: 13px;
+}
+
+.claudian-model-provider-tab[aria-selected='true']::before {
+  content: '';
+  position: absolute;
+  inset-inline-start: -8px;
+  top: 4px;
+  bottom: 4px;
+  width: 2.5px;
+  border-radius: 2px;
+  background: var(--claudian-provider-logo);
+}

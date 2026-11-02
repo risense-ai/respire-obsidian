@@ -1,0 +1,42 @@
+// @test-ci {"inputs":["src/style/**"]}
+/** @vitest-environment jsdom */
+
+import { readFileSync } from 'node:fs';
+import path from 'node:path';
+
+describe('Tool renderer hover tooltips', () => {
+  it.each(['claudian-tool-header', 'claudian-write-edit-header'])('suppresses Obsidian tooltips on %s', (className) => {
+    const style = document.createElement('style');
+    style.textContent = readFileSync(path.resolve('src/style/components/toolcalls.css'), 'utf8');
+    document.head.appendChild(style);
+    const header = document.createElement('div');
+    header.className = className;
+    document.body.appendChild(header);
+
+    try {
+      // Obsidian checks this inherited property before showing aria-label tooltips.
+      expect(getComputedStyle(header).getPropertyValue('--no-tooltip').trim()).toBe('true');
+    } finally {
+      header.remove();
+      style.remove();
+    }
+  });
+});
+
+describe('Session message tool card', () => {
+  it('keeps the line breaks of the delivered plain-text message', () => {
+    const style = document.createElement('style');
+    style.textContent = readFileSync(path.resolve('src/style/components/toolcalls.css'), 'utf8');
+    document.head.appendChild(style);
+    const message = document.createElement('div');
+    message.className = 'claudian-session-tool-message';
+    document.body.appendChild(message);
+
+    try {
+      expect(getComputedStyle(message).whiteSpace).toBe('pre-wrap');
+    } finally {
+      message.remove();
+      style.remove();
+    }
+  });
+});

@@ -1,0 +1,13 @@
+Respire for Obsidian
+Copyright (c) 2026 risense-ai
+
+This project is a fork of Claudian (https://github.com/yishentu/claudian),
+Copyright (c) 2025 Yishen Tu, which is licensed under the MIT License. The
+original copyright and permission notice are retained in LICENSE.
+
+The fork adds optional integration with Respire memory (rsrs). It is not
+affiliated with or endorsed by the Claudian author, Obsidian, Anthropic,
+OpenAI, or any other provider mentioned in the documentation.
+
+Third-party names and marks (including Obsidian, Claude, Claude Code, Codex,
+OpenCode, and Respire) belong to their respective owners.

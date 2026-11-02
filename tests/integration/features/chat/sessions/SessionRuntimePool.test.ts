@@ -1,0 +1,248 @@
+import { createHarness, deferred } from '@test/helpers/ChatExecutionHarness';
+import { createSessionModelStub } from '@test/helpers/ConversationPorts';
+
+import { ConversationLifecycle } from '@/features/chat/conversation/ConversationLifecycle';
+import { ChatSessionRuntime } from '@/features/chat/sessions/ChatSessionRuntime';
+import { SessionRuntimePool } from '@/features/chat/sessions/SessionRuntimePool';
+
+const nextTask = () => new Promise<void>(resolve => setImmediate(resolve));
+
+describe('session ownership across presentations', () => {
+  function setup(options: {
+    retainedDetachedSessions?: number;
+    releaseHistory?: (id: string) => Promise<boolean>;
+    onError?: (error: unknown) => void;
+  } = {}) {
+    const harness = createHarness();
+    const pool = new SessionRuntimePool({
+      createRuntime: identity => new ChatSessionRuntime(identity, harness.coordinator, session => createSessionModelStub(session)),
+      releaseHistory: options.releaseHistory ?? (async () => true),
+      retainedDetachedSessions: options.retainedDetachedSessions,
+      onChanged: () => undefined,
+      onError: options.onError ?? (error => { throw error; }),
+    });
+    return { pool, harness };
+  }
+
+  it('reserves one attachment before awaits, promotes a running draft in place, and ignores stale detach', async () => {
+    const { pool } = setup();
+    const owner = { reveal: vi.fn() };
+    const first = pool.acquire({ conversationId: null, providerId: 'claude', draftModel: 'model' }, owner);
+    const runtime = first.attachment.runtime;
+    expect(runtime.peekModel).toBeNull();
+    await expect(pool.awaitConversationCreations()).resolves.toBeUndefined();
+    expect(runtime.peekModel).toBeNull();
+    const held = deferred<void>();
+    let signal!: AbortSignal;
+    const turn = runtime.turns.run(async current => { signal = current; await held.promise; });
+    pool.release(first.attachment);
+    runtime.setConversationId('created');
+    expect(pool.get('created')).toBe(runtime);
+    expect(() => runtime.setConversationId('replacement')).toThrow('bound session');
+    expect(() => runtime.bindConversation('created', 'codex')).toThrow('bound session');
+    expect(pool.get('replacement')).toBeNull();
+    expect(pool.get('created')).toBe(runtime);
+    expect(pool.isRunning('created')).toBe(true);
+    expect(signal.aborted).toBe(false);
+    const store = {
+      getConversationList: () => [],
+      deleteConversation: vi.fn(async () => undefined),
+      setConversationArchived: vi.fn(async () => undefined),
+      setConversationsPlacement: vi.fn(async () => undefined),
+      restoreConversations: vi.fn(async () => undefined),
+      ensureAllConversationMetadataLoaded: vi.fn().mockResolvedValue(undefined),
+      archiveProjectIfEmpty: vi.fn(async () => undefined),
+      archiveConversationsIf: vi.fn(async () => 1),
+    };
+    const lifecycle = new ConversationLifecycle({ sessions: pool, conversations: store, projects: { get: () => null, setArchived: async () => undefined }, views: { getAllViews: () => [] } });
+    await lifecycle.setArchived('created', true);
+    await lifecycle.delete(['created']);
+    expect(store.archiveConversationsIf).not.toHaveBeenCalled();
+    expect(store.deleteConversation).not.toHaveBeenCalled();
+
+    const second = pool.acquire({ conversationId: 'created', providerId: 'claude', draftModel: null }, owner);
+    expect(second.acquired).toBe(true);
+    expect(second.attachment.runtime).toBe(runtime);
+    pool.release(first.attachment);
+    const duplicate = pool.acquire({ conversationId: 'created', providerId: 'claude', draftModel: null }, { reveal: vi.fn() });
+    expect(duplicate.acquired).toBe(false);
+    expect(duplicate.attachment).toBe(second.attachment);
+    const settled = pool.whenSettled('created');
+    let settledResult: boolean | undefined;
+    void settled.then(value => { settledResult = value; });
+    runtime.attention.setActionRequired(true);
+    await nextTask();
+    expect(settledResult).toBeUndefined();
+    runtime.attention.setActionRequired(false);
+    held.resolve();
+    await turn;
+    await expect(settled).resolves.toBe(true);
+    await lifecycle.setArchived('created', true);
+    await lifecycle.delete(['created']);
+    expect(store.archiveConversationsIf).toHaveBeenCalledWith(['created'], expect.any(Function));
+    expect(store.deleteConversation).toHaveBeenCalledWith('created');
+    const competing = pool.acquire({ conversationId: null, providerId: 'claude', draftModel: 'model' }, owner);
+    expect(() => competing.attachment.runtime.setConversationId('created')).toThrow();
+    expect(pool.get('created') === runtime).toBe(true);
+    const stillOwned = pool.acquire({ conversationId: 'created', providerId: 'claude', draftModel: null }, { reveal: vi.fn() });
+    expect(stillOwned.acquired).toBe(false);
+    expect(stillOwned.attachment === second.attachment).toBe(true);
+    await pool.dispose();
+  });
+
+  it('fences admissions synchronously and drains a session after its last view detached', async () => {
+    const { pool, harness } = setup();
+    const { attachment } = pool.acquire({ conversationId: 'running', providerId: 'claude', draftModel: null }, { reveal: vi.fn() });
+    const runtime = attachment.runtime;
+    for (const id of ['running', 'missing']) {
+      const settled = await Promise.race([pool.whenSettled(id), nextTask().then(() => 'pending')]);
+      expect(settled).toBe(true);
+    }
+    const cancelled = deferred<void>();
+    const finish = deferred<void>();
+    const turn = runtime.turns.run(async signal => {
+      signal.addEventListener('abort', () => cancelled.resolve(), { once: true });
+      await finish.promise;
+    });
+    const settled = pool.whenSettled('running');
+    pool.release(attachment);
+    let drained = false;
+    const shutdown = pool.dispose().then(() => { drained = true; });
+    try {
+      expect(runtime.acceptsIntents).toBe(false);
+      expect(() => pool.acquire({ conversationId: null, providerId: null, draftModel: null }, { reveal: vi.fn() })).toThrow();
+      expect(() => pool.ensure({ conversationId: 'late', providerId: 'claude', draftModel: null })).toThrow();
+      await expect(settled).resolves.toBe(false);
+      await expect(pool.whenSettled('running')).resolves.toBe(false);
+      await expect(pool.whenSettled('missing')).resolves.toBe(false);
+      await cancelled.promise;
+      expect(drained).toBe(false);
+    } finally {
+      finish.resolve();
+      await Promise.all([shutdown, turn]);
+    }
+    expect(harness.coordinator.state).toBe('disposed');
+    expect(drained).toBe(true);
+  });
+
+  it('keeps a held detached draft reachable by its key, through promotion, until the hold ends', async () => {
+    const { pool } = setup();
+    const owner = { reveal: vi.fn() };
+    // A presentation can reacquire a cold draft before the queued eviction begins.
+    const transient = pool.acquire({ conversationId: null, providerId: 'claude', draftModel: null }, owner).attachment;
+    pool.release(transient);
+    const rebound = pool.acquire({ conversationId: null, providerId: 'claude', draftModel: null, draftSessionKey: transient.runtime.sessionKey }, owner).attachment;
+    await nextTask();
+    expect(rebound.runtime).toBe(transient.runtime);
+    expect(rebound.runtime.isDisposed).toBe(false);
+    pool.release(rebound);
+    // Work admitted before eviction can finish while that attempt still owns the retry.
+    await rebound.runtime.turns.run(async () => undefined);
+    await nextTask();
+    expect(rebound.runtime.isDisposed).toBe(true);
+
+    const draft = pool.acquire({ conversationId: null, providerId: 'claude', draftModel: 'model' }, owner).attachment;
+    const runtime = draft.runtime;
+    runtime.providerSelections.set('claude', { permissionMode: 'normal', serviceTier: 'default' });
+    const hold = pool.holdDraft(runtime);
+    pool.release(draft);
+    await nextTask();
+    expect(runtime.isDisposed).toBe(false);
+
+    const again = pool.acquire({ conversationId: null, providerId: 'claude', draftModel: 'model', draftSessionKey: hold.key }, owner);
+    expect(again.attachment.runtime).toBe(runtime);
+    pool.release(again.attachment);
+    runtime.setConversationId('created');
+    const promoted = pool.acquire({ conversationId: null, providerId: 'claude', draftModel: null, draftSessionKey: hold.key }, owner);
+    expect(promoted.attachment.runtime).toBe(runtime);
+    pool.release(promoted.attachment);
+    hold.release();
+
+    const unheld = pool.acquire({ conversationId: null, providerId: 'claude', draftModel: 'model' }, owner).attachment;
+    const released = pool.holdDraft(unheld.runtime);
+    const remaining = pool.holdDraft(unheld.runtime);
+    pool.release(unheld);
+    // A user event can run while the detached draft is held; its first eviction has declined.
+    await nextTask();
+    released.release();
+    released.release();
+    await nextTask();
+    expect(unheld.runtime.isDisposed).toBe(false);
+    expect(pool.getAll()).toContain(unheld.runtime);
+    remaining.release();
+    await nextTask();
+    expect(unheld.runtime.isDisposed).toBe(true);
+    expect(pool.acquire({ conversationId: null, providerId: 'claude', draftModel: 'model', draftSessionKey: released.key }, owner)
+      .attachment.runtime).not.toBe(unheld.runtime);
+    await pool.dispose();
+  });
+
+  it('keeps the most recently viewed idle sessions loaded and releases the least recent beyond the limit', async () => {
+    const released: string[] = [];
+    const { pool } = setup({ retainedDetachedSessions: 2, releaseHistory: async id => { released.push(id); return true; } });
+    const owner = { reveal: vi.fn() };
+    const view = (id: string) => {
+      const { attachment } = pool.acquire({ conversationId: id, providerId: 'claude', draftModel: null }, owner);
+      const model = attachment.runtime.model;
+      return { attachment, model };
+    };
+
+    const a = view('a');
+    pool.release(a.attachment);
+    const b = view('b');
+    pool.release(b.attachment);
+    await nextTask();
+    expect(released).toEqual([]);
+    expect(a.attachment.runtime.peekModel).toBe(a.model);
+
+    // Viewing a third session pushes the least recently viewed one out.
+    const c = view('c');
+    pool.release(c.attachment);
+    await nextTask();
+    expect(released).toEqual(['a']);
+    expect(a.attachment.runtime.peekModel).toBeNull();
+
+    // Returning to a retained session reuses its loaded model and refreshes its recency.
+    const again = view('b');
+    expect(again.model).toBe(b.model);
+    pool.release(again.attachment);
+    const d = view('d');
+    pool.release(d.attachment);
+    await nextTask();
+    expect(released).toEqual(['a', 'c']);
+    expect(b.attachment.runtime.peekModel).toBe(b.model);
+    expect(d.attachment.runtime.peekModel).toBe(d.model);
+    await pool.dispose();
+  });
+
+  it('flushes a retained session\'s pending save on detach and reports a failed retry, keeping its history', async () => {
+    const released: string[] = [];
+    const onError = vi.fn();
+    const { pool } = setup({ retainedDetachedSessions: 2, onError, releaseHistory: async id => { released.push(id); return true; } });
+    const { attachment } = pool.acquire({ conversationId: 'unsaved', providerId: 'claude', draftModel: null }, { reveal: vi.fn() });
+    const model = attachment.runtime.model;
+    // A save that failed at the end of a turn left the conversation dirty.
+    const state = { isRewinding: false, hasPendingConversationSave: true };
+    Object.defineProperty(model, 'state', { get: () => state });
+    const failure = new Error('Vault unavailable');
+    const save = vi.spyOn(model.conversationController, 'save').mockRejectedValueOnce(failure);
+
+    pool.release(attachment);
+    await nextTask();
+    expect(save).toHaveBeenCalledWith(false);
+    expect(onError).toHaveBeenCalledWith(failure);
+    expect(released).toEqual([]);
+    expect(attachment.runtime.peekModel).toBe(model);
+
+    // Viewing another session does not retry this session's failing save again.
+    save.mockRejectedValue(failure);
+    const other = pool.acquire({ conversationId: 'other', providerId: 'claude', draftModel: null }, { reveal: vi.fn() });
+    void other.attachment.runtime.model;
+    pool.release(other.attachment);
+    await nextTask();
+    expect(save).toHaveBeenCalledTimes(1);
+    expect(onError).toHaveBeenCalledTimes(1);
+    save.mockResolvedValue(undefined);
+    await pool.dispose();
+  });
+});

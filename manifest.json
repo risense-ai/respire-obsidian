@@ -1,0 +1,10 @@
+{
+  "id": "respire",
+  "name": "Respire",
+  "version": "1.0.0",
+  "minAppVersion": "1.13.0",
+  "description": "Chat with coding agents in your vault, with optional local-first rsrs memory recall and automatic session notes.",
+  "author": "risense-ai",
+  "authorUrl": "https://github.com/risense-ai",
+  "isDesktopOnly": true
+}

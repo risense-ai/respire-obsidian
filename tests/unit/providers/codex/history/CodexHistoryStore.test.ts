@@ -1,0 +1,3228 @@
+// @test-ci {"native":true,"inputs":["tests/fixtures/providers/codex/history/codex-session-{persisted-tools,agent-lifecycle,websearch-persisted}.jsonl"]}
+import { parseCodexSessionContent } from '@test/helpers/providers/codex/parseCodexSessionContent';
+import { testDate, testTime } from '@test/helpers/testClock';
+import type { Dirent } from 'fs';
+import * as path from 'path';
+import { pathToFileURL } from 'url';
+
+import { encodeRecoveryPrompt } from '@/core/prompt/recoveryPrompt';
+import { encodeSessionMessage } from '@/core/session-tools/sessionMessageEnvelope';
+import {
+  CodexHistoryDeadlineError,
+  deriveCodexSessionsRootFromSessionPath,
+  findCodexSessionFileAsync,
+  parseCodexSessionFileAsync,
+  parseCodexSessionTurns,
+  runBeforeDeadline,
+} from '@/providers/codex/history/CodexHistoryStore';
+
+const FIXTURES_DIR = path.join(__dirname, '../../../../fixtures/providers/codex/history');
+
+describe('CodexHistoryStore', () => {
+  it.each(['direct', 'script'])('restores sender metadata and native tool identity from a %s call', kind => {
+    const content = [
+      { type: 'event_msg', payload: { type: 'user_message', message: encodeSessionMessage({ from: 'Planner', sessionId: 'sender', text: 'Hello' }) } },
+      { type: 'response_item', payload: kind === 'direct'
+        ? { type: 'function_call', name: 'claudian_sessions__claudian_send_message', call_id: 'send', arguments: '{"text":"Reply","sessionId":"sender"}' }
+        : { type: 'custom_tool_call', name: 'exec', call_id: 'send', input: 'text(await tools.claudian_sessions__claudian_send_message({text:"Reply",sessionId:"sender"}));' } },
+      { type: 'response_item', payload: { type: kind === 'direct' ? 'function_call_output' : 'custom_tool_call_output', call_id: 'send', output: '{"sessionId":"sender","status":"started"}' } },
+    ].map(record => JSON.stringify({ ...record, timestamp: testDate().toISOString() })).join('\n');
+    const messages = parseCodexSessionContent(content);
+    expect(messages.find(message => message.role === 'user')).toMatchObject({ displayContent: 'Hello', sessionMessage: { from: 'Planner', sessionId: 'sender' } });
+    expect(messages.flatMap(message => message.toolCalls ?? [])).toEqual([expect.objectContaining({ name: 'claudian_send_message', providerPayload: expect.objectContaining({ rawName: 'claudian_sessions__claudian_send_message' }) })]);
+  });
+
+  it.each(['function_call', 'custom_tool_call'])('replays native activity across parent turns with a raw %s follow-up', rawType => {
+    let seconds = 0;
+    const event = (type: string, payload: Record<string, unknown>) => ({ type, timestamp: testDate({ seconds: seconds++ }).toISOString(), payload });
+    const activity = (id: string, kind: string) => event('event_msg', { type: 'item_completed', item: {
+      type: 'SubAgentActivity', id, kind, agent_thread_id: 'child', agent_path: '/root/helper',
+    } });
+    const records = [
+      event('event_msg', { type: 'task_started', turn_id: 'first' }),
+      event('response_item', { type: 'function_call', name: 'spawn_agent', call_id: 'spawn', arguments: JSON.stringify({ task_name: 'helper', message: 'gAAAAAEncryptedPrompt==' }) }),
+      activity('spawn', 'started'),
+      event('response_item', { type: 'function_call_output', call_id: 'spawn', output: '{"task_name":"/root/helper"}' }),
+      event('event_msg', { type: 'task_complete', turn_id: 'first' }),
+      activity('complete-1', 'completed'),
+      event('event_msg', { type: 'task_started', turn_id: 'second' }),
+      activity('followup', 'interacted'),
+      event('event_msg', { type: 'task_complete', turn_id: 'second' }),
+      activity('complete-2', 'interrupted'),
+    ];
+    const followupRecords = [
+      event('event_msg', { type: 'task_started', turn_id: 'third' }),
+      event('response_item', rawType === 'function_call'
+        ? { type: rawType, name: 'followup_task', call_id: 'raw-followup', arguments: '{"target":"helper","message":"Continue"}' }
+        : { type: rawType, name: 'exec', call_id: 'raw-followup', input: 'text(await tools.followup_task({target:"helper",message:"Continue"}));' }),
+      activity('raw-followup', 'interacted'),
+      event('event_msg', { type: 'task_complete', turn_id: 'third' }),
+      activity('complete-3', 'completed'),
+      event('event_msg', { type: 'item_completed', item: { type: 'SubAgentActivity', id: 'unrelated-completion', kind: 'completed', agent_thread_id: 'unknown-child', agent_path: '/root/other' } }),
+    ];
+    const allRecords = [...records, ...followupRecords];
+    const tools = parseCodexSessionContent(allRecords.map(record => JSON.stringify(record)).join('\n'))
+      .flatMap(message => message.toolCalls ?? []);
+    expect(tools).toHaveLength(3);
+    expect(tools[0].subagent).toMatchObject({ id: 'spawn', agentId: 'child', lifecycleSource: 'session', status: 'completed', prompt: '', completedAt: testDate({ seconds: 5 }).getTime() });
+    expect(tools[1].subagent).toMatchObject({ id: 'followup', agentId: 'child', lifecycleSource: 'session', status: 'error', startedAt: testDate({ seconds: 7 }).getTime(), completedAt: testDate({ seconds: 9 }).getTime() });
+    expect(tools[2].subagent).toMatchObject({ id: 'raw-followup', description: tools[0].subagent?.description, status: 'completed', startedAt: testDate({ seconds: 12 }).getTime(), completedAt: testDate({ seconds: 14 }).getTime() });
+    const runningTools = parseCodexSessionContent(allRecords.slice(0, 13).map(record => JSON.stringify(record)).join('\n'))
+      .flatMap(message => message.toolCalls ?? []);
+    expect(runningTools[2].subagent).toMatchObject({ status: 'running', description: tools[0].subagent?.description });
+    const initialTools = parseCodexSessionContent(records.slice(0, 3).map(record => JSON.stringify(record)).join('\n'))
+      .flatMap(message => message.toolCalls ?? []);
+    expect(initialTools[0].subagent).toMatchObject({ status: 'running', startedAt: testDate({ seconds: 2 }).getTime() });
+    const idleTools = parseCodexSessionContent(records.slice(0, -1).map(record => JSON.stringify(record)).join('\n'))
+      .flatMap(message => message.toolCalls ?? []);
+    expect(idleTools.filter(tool => tool.subagent)).toHaveLength(1);
+    expect(idleTools[1]).toMatchObject({ id: 'followup', name: 'send_input', status: 'completed' });
+    const prefix = parseCodexSessionTurns(records.map(record => JSON.stringify(record)).join('\n'), 'first');
+    expect(prefix.flatMap(turn => turn.messages.flatMap(message => message.toolCalls ?? []))[0].subagent)
+      .toMatchObject({ status: 'completed', completedAt: testDate({ seconds: 5 }).getTime() });
+  });
+
+  it('ends the whole lookup at the deadline when a directory read never resolves', async () => {
+    // Only timers are fake: the deadline timer fires while the real clock is still short of the
+    // deadline, as Node timers can by a millisecond.
+    vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout'] });
+    try {
+      const root = '/virtual/codex/sessions';
+      const directory = (name: string) => ({ name, isDirectory: () => true, isFile: () => false }) as Dirent;
+      const pathExists = vi.fn(async (value: string) => value === root);
+      const readDirectory = vi.fn((value: string) => (value === root
+        ? Promise.resolve([directory('older'), directory('newer')])
+        : new Promise<never>(() => {})));
+      const lookup = findCodexSessionFileAsync('thread', root, 60_000, { pathExists, readDirectory });
+
+      await vi.waitFor(() => expect(readDirectory).toHaveBeenCalledWith(path.join(root, 'newer')));
+      await vi.advanceTimersByTimeAsync(60_000);
+
+      await expect(lookup).resolves.toBeNull();
+      // The expired lookup must not move on to the remaining directory.
+      expect(readDirectory).not.toHaveBeenCalledWith(path.join(root, 'older'));
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it('rejects an expired lookup before starting I/O and clears deadline timers after settlement', async () => {
+    vi.useFakeTimers();
+    try {
+      vi.setSystemTime(testDate());
+      const operation = vi.fn(async () => 'found');
+      await expect(runBeforeDeadline(operation, Date.now())).rejects.toBeInstanceOf(CodexHistoryDeadlineError);
+      expect(operation).not.toHaveBeenCalled();
+      await expect(runBeforeDeadline(operation, Date.now() + 10_000)).resolves.toBe('found');
+      expect(vi.getTimerCount()).toBe(0);
+      const failure = Object.assign(new Error('Directory denied'), { code: 'EACCES' });
+      await expect(runBeforeDeadline(async () => { throw failure; }, Date.now() + 10_000)).rejects.toBe(failure);
+      expect(vi.getTimerCount()).toBe(0);
+    } finally { vi.useRealTimers(); }
+  });
+
+  it.each(['../outside', 'thread/../../outside', 'thread.jsonl', 'thread\n'])('rejects unsafe session id %j before filesystem access', async threadId => {
+    const pathExists = vi.fn(async () => true);
+    const readDirectory = vi.fn(async () => []);
+    await expect(findCodexSessionFileAsync(threadId, '/vault/sessions', 10_000, { pathExists, readDirectory })).resolves.toBeNull();
+    expect(pathExists).not.toHaveBeenCalled();
+    expect(readDirectory).not.toHaveBeenCalled();
+  });
+
+  it('ignores retired event-wrapper transcripts', () => {
+    const content = [
+      { type: 'event', event: { type: 'turn.started' } },
+      { type: 'event', event: { type: 'item.completed', item: { id: 'answer', type: 'agent_message', text: 'Retired' } } },
+      { type: 'event', event: { type: 'turn.completed' } },
+    ].map(record => JSON.stringify(record)).join('\n');
+    expect(parseCodexSessionContent(content)).toEqual([]);
+  });
+
+  describe('path helpers', () => {
+    it('derives transcript roots from POSIX session paths', () => {
+      const sessionFilePath = '/home/user/.codex/sessions/2026/04/14/rollout-thread.jsonl';
+
+      expect(deriveCodexSessionsRootFromSessionPath(sessionFilePath)).toBe('/home/user/.codex/sessions');
+    });
+
+    it.each([
+      ['\\\\wsl$\\Ubuntu\\home\\user\\.codex\\sessions\\2026\\04\\14\\rollout-thread.jsonl', '\\\\wsl$\\Ubuntu\\home\\user\\.codex\\sessions'],
+      ['//wsl$\\Ubuntu\\home\\user\\.codex\\sessions\\2026\\04\\14\\rollout-thread.jsonl', '\\\\wsl$\\Ubuntu\\home\\user\\.codex\\sessions'],
+      ['C:\\Users\\user\\.codex\\sessions\\2026\\04\\14\\rollout-thread.jsonl', 'C:\\Users\\user\\.codex\\sessions'],
+      ['C:/Users/user/.codex/sessions/2026/04/14/rollout-thread.jsonl', 'C:\\Users\\user\\.codex\\sessions'],
+    ])('derives transcript roots from Windows session paths: %s', (sessionFilePath, sessionsRoot) => {
+      expect(deriveCodexSessionsRootFromSessionPath(sessionFilePath)).toBe(sessionsRoot);
+    });
+  });
+
+  describe('parseCodexSessionFileAsync - simple session', () => {
+
+    it.each([
+      { source: 'content', reasoning: { summary: [], content: ['First thought', '  ', ' second thought'] }, completed: true },
+      { source: 'summary only', reasoning: { summary: [{ type: 'summary_text', text: 'First thought' }, { type: 'summary_text', text: ' second thought' }] }, completed: false },
+      { source: 'summary over raw content', reasoning: { summary: ['First thought', ' second thought'], content: ['Raw reasoning is not the displayed summary'], text: 'Fallback text' }, completed: false },
+      { source: 'text after null content', reasoning: { content: null, text: 'First thought\n\nsecond thought' }, completed: false },
+      { source: 'text after empty content', reasoning: { content: [], text: 'First thought\n\nsecond thought' }, completed: false },
+    ])('rebuilds $source reasoning from a persisted transcript (completed: $completed)', ({ reasoning, completed }) => {
+      const records = [
+        { type: 'response_item', payload: { type: 'message', role: 'user', content: [{ type: 'input_text', text: 'Explain this.' }] } },
+        { type: 'response_item', payload: { type: 'reasoning', ...reasoning } },
+        ...(completed ? [{ type: 'response_item', payload: { type: 'message', role: 'assistant', content: [{ type: 'output_text', text: 'Done.' }] } }] : []),
+      ];
+      const messages = parseCodexSessionContent(records.map((record, seconds) => JSON.stringify({
+        timestamp: testDate({ seconds }).toISOString(), ...record,
+      })).join('\n'));
+
+      expect(messages).toHaveLength(2);
+      expect(messages[0]).toMatchObject({ role: 'user', content: 'Explain this.' });
+      expect(messages[1]).toMatchObject({ role: 'assistant', content: completed ? 'Done.' : '' });
+      expect(messages[1].contentBlocks).toEqual([
+        { type: 'thinking', content: 'First thought\n\nsecond thought' },
+        ...(completed ? [{ type: 'text', content: 'Done.' }] : []),
+      ]);
+    });
+
+    it('preserves interleaved reasoning, tools, and assistant text in transcript order', () => {
+      const content = [
+        JSON.stringify({
+          timestamp: '2026-07-13T00:00:00.000Z',
+          type: 'event_msg',
+          payload: { type: 'task_started' },
+        }),
+        JSON.stringify({
+          timestamp: '2026-07-13T00:00:01.000Z',
+          type: 'event_msg',
+          payload: { type: 'agent_reasoning', text: 'Inspecting the note.' },
+        }),
+        JSON.stringify({
+          timestamp: '2026-07-13T00:00:01.001Z',
+          type: 'response_item',
+          payload: {
+            type: 'reasoning',
+            summary: [{ type: 'summary_text', text: 'Inspecting the note.' }],
+          },
+        }),
+        JSON.stringify({
+          timestamp: '2026-07-13T00:00:02.000Z',
+          type: 'response_item',
+          payload: {
+            type: 'custom_tool_call',
+            name: 'exec',
+            call_id: 'call_read',
+            input: 'const r = await tools.exec_command({cmd:"sed -n \'1,20p\' DEMO.md"}); text(r.output);',
+          },
+        }),
+        JSON.stringify({
+          timestamp: '2026-07-13T00:00:03.000Z',
+          type: 'response_item',
+          payload: {
+            type: 'custom_tool_call_output',
+            call_id: 'call_read',
+            output: 'Script completed\nOutput:\nDemo content',
+          },
+        }),
+        JSON.stringify({
+          timestamp: '2026-07-13T00:00:04.000Z',
+          type: 'event_msg',
+          payload: { type: 'agent_reasoning', text: 'Verifying the edit.' },
+        }),
+        JSON.stringify({
+          timestamp: '2026-07-13T00:00:04.001Z',
+          type: 'response_item',
+          payload: {
+            type: 'reasoning',
+            summary: [{ type: 'summary_text', text: 'Verifying the edit.' }],
+          },
+        }),
+        JSON.stringify({
+          timestamp: '2026-07-13T00:00:05.000Z',
+          type: 'response_item',
+          payload: {
+            type: 'custom_tool_call',
+            name: 'exec',
+            call_id: 'call_verify',
+            input: 'const r = await tools.exec_command({cmd:"tail -n 2 DEMO.md"}); text(r.output);',
+          },
+        }),
+        JSON.stringify({
+          timestamp: '2026-07-13T00:00:06.000Z',
+          type: 'response_item',
+          payload: {
+            type: 'custom_tool_call_output',
+            call_id: 'call_verify',
+            output: 'Script completed\nOutput:\nEdited',
+          },
+        }),
+        JSON.stringify({
+          timestamp: '2026-07-13T00:00:07.000Z',
+          type: 'event_msg',
+          payload: { type: 'agent_message', message: 'Done.' },
+        }),
+        JSON.stringify({
+          timestamp: '2026-07-13T00:00:07.001Z',
+          type: 'response_item',
+          payload: {
+            type: 'message',
+            role: 'assistant',
+            content: [{ type: 'output_text', text: 'Done.' }],
+          },
+        }),
+      ].join('\n');
+
+      const messages = parseCodexSessionContent(content);
+      const assistantMessage = messages.find(message => message.role === 'assistant');
+
+      expect(assistantMessage?.contentBlocks).toEqual([
+        { type: 'thinking', content: 'Inspecting the note.' },
+        { type: 'tool_use', toolId: 'call_read' },
+        { type: 'thinking', content: 'Verifying the edit.' },
+        { type: 'tool_use', toolId: 'call_verify' },
+        { type: 'text', content: 'Done.' },
+      ]);
+    });
+
+    it('replays memory citations without exposing raw markup or duplicating assistant text', () => {
+      const baseEntries = [
+        { path: 'MEMORY.md', lineStart: 10, lineEnd: 12, note: 'Used project conventions' },
+        { path: 'notes/build.md', lineStart: 30, lineEnd: 35, note: 'Build instructions' },
+      ];
+      const differentGroups = [
+        [baseEntries[0], { ...baseEntries[1], path: 'notes/test.md' }],
+        [baseEntries[0], { ...baseEntries[1], lineStart: 31 }],
+        [baseEntries[0], { ...baseEntries[1], lineEnd: 36 }],
+        [baseEntries[0], { ...baseEntries[1], note: 'Updated build instructions' }],
+        [...baseEntries, { path: 'notes/deploy.md', lineStart: 1, lineEnd: 2, note: 'Deployment' }],
+      ];
+      const adjacentGroups = [baseEntries, baseEntries, ...differentGroups.flatMap(entries => [entries, baseEntries])];
+      const citationMarkup = [
+        '<oai-mem-citation>',
+        '<citation_entries>',
+        'MEMORY.md:10-12|note=[Used project conventions]',
+        'notes/build.md:30-35|note=[Build instructions]',
+        '</citation_entries>',
+        '<rollout_ids>',
+        'thread-1',
+        '</rollout_ids>',
+        '</oai-mem-citation>',
+      ].join('\n');
+      const content = [
+        JSON.stringify({
+          timestamp: testDate({ seconds: 0 }).toISOString(),
+          type: 'event_msg',
+          payload: { type: 'task_started' },
+        }),
+        JSON.stringify({
+          timestamp: testDate({ seconds: 1 }).toISOString(),
+          type: 'event_msg',
+          payload: {
+            type: 'agent_message',
+            message: 'Answer',
+            memory_citation: {
+              entries: baseEntries,
+              rolloutIds: ['thread-1'],
+            },
+          },
+        }),
+        JSON.stringify({
+          timestamp: testDate({ seconds: 2 }).toISOString(),
+          type: 'response_item',
+          payload: {
+            type: 'message',
+            role: 'assistant',
+            content: [{ type: 'output_text', text: `Answer\n${citationMarkup}` }],
+          },
+        }),
+        ...adjacentGroups.map((entries, index) => JSON.stringify({
+          timestamp: testDate({ seconds: 2 + (index + 1) / 100 }).toISOString(),
+          type: 'event_msg', payload: { type: 'agent_message', message: '', memory_citation: { entries } },
+        })),
+        JSON.stringify({
+          timestamp: testDate({ seconds: 3 }).toISOString(),
+          type: 'event_msg',
+          payload: { type: 'task_complete' },
+        }),
+      ].join('\n');
+
+      const messages = parseCodexSessionContent(content);
+      const assistantMessage = messages.find(message => message.role === 'assistant');
+
+      expect(assistantMessage?.content).toBe('Answer');
+      expect(assistantMessage?.content).not.toContain('oai-mem-citation');
+      expect(assistantMessage?.contentBlocks).toEqual([
+        { type: 'text', content: 'Answer' },
+        ...[baseEntries, ...differentGroups.flatMap(entries => [entries, baseEntries])]
+          .map(entries => ({ type: 'citations', citations: { kind: 'memory', entries } })),
+      ]);
+    });
+
+    it.each([
+      { kind: 'text and string URL', visibleText: true },
+      { kind: 'image-only string URL', visibleText: false },
+    ])('rehydrates user images from persisted input_image parts: $kind', ({ visibleText }) => {
+      const data = 'iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+jP9sAAAAASUVORK5CYII=';
+      const url = `data:image/png;base64,${data}`;
+      const records = [
+        { type: 'response_item', payload: { type: 'message', role: 'user', content: [
+          ...(visibleText ? [{ type: 'input_text', text: '<image name=[Image #1] path="/tmp/1-image-1.png">' }] : []),
+          { type: 'input_image', image_url: url },
+          { type: 'input_image', image_url: 'data:image/png;base64,c2Vjb25k' },
+          { type: 'input_text', text: '' },
+          ...(visibleText ? [{ type: 'input_text', text: '</image>' }, { type: 'input_text', text: 'What is in this image?' }] : []),
+        ] } },
+        { type: 'response_item', payload: { type: 'message', role: 'assistant', content: [{ type: 'output_text', text: 'A single pixel.' }] } },
+      ];
+      const content = records.map((record, seconds) => JSON.stringify({
+        timestamp: testDate({ seconds }).toISOString(), ...record,
+      })).join('\n');
+      const messages = parseCodexSessionContent(content);
+
+      expect(messages).toHaveLength(2);
+      expect(messages[0]).toMatchObject({
+        role: 'user', content: visibleText ? 'What is in this image?' : '',
+        images: [
+          { data, id: expect.any(String), mediaType: 'image/png', name: 'image-1.png', size: Buffer.from(data, 'base64').length, source: 'paste' },
+          { data: 'c2Vjb25k', id: expect.any(String), mediaType: 'image/png', name: 'image-2.png', size: 6, source: 'paste' },
+        ],
+      });
+      expect(messages[0].images?.every(image => image.id.length > 0)).toBe(true);
+      expect(new Set(messages[0].images?.map(image => image.id)).size).toBe(2);
+      expect(parseCodexSessionContent(content)[0].images).toEqual(messages[0].images);
+      expect(messages[1]).toMatchObject({ role: 'assistant', content: 'A single pixel.', durationSeconds: 1 });
+    });
+  });
+
+  describe('parseCodexSessionFileAsync - non-existent file', () => {
+    it('should return empty array for missing files', async () => {
+      const messages = await parseCodexSessionFileAsync('/nonexistent/path.jsonl');
+      expect(messages).toEqual([]);
+    });
+  });
+
+  describe('parseCodexSessionContent - persisted response items', () => {
+    it('reconstructs user and assistant turns from response_item logs', () => {
+      const content = [
+        JSON.stringify({
+          timestamp: '2026-03-27T00:00:00.000Z',
+          type: 'response_item',
+          payload: {
+            type: 'message',
+            role: 'user',
+            content: [{ type: 'input_text', text: 'Review this diff.' }],
+          },
+        }),
+        JSON.stringify({
+          timestamp: '2026-03-27T00:00:01.000Z',
+          type: 'event_msg',
+          payload: {
+            type: 'agent_reasoning',
+            text: 'Thinking through the changes.',
+          },
+        }),
+        JSON.stringify({
+          timestamp: '2026-03-27T00:00:02.000Z',
+          type: 'response_item',
+          payload: {
+            type: 'function_call',
+            name: 'shell_command',
+            arguments: '{"command":"git diff --stat"}',
+            call_id: 'call_1',
+          },
+        }),
+        JSON.stringify({
+          timestamp: '2026-03-27T00:00:03.000Z',
+          type: 'response_item',
+          payload: {
+            type: 'function_call_output',
+            call_id: 'call_1',
+            output: 'Exit code: 0\nOutput:\n src/main.ts | 2 +-',
+          },
+        }),
+        JSON.stringify({
+          timestamp: '2026-03-27T00:00:04.000Z',
+          type: 'response_item',
+          payload: {
+            type: 'message',
+            role: 'assistant',
+            content: [{ type: 'output_text', text: 'The diff looks good.' }],
+          },
+        }),
+      ].join('\n');
+
+      const messages = parseCodexSessionContent(content);
+
+      expect(messages).toHaveLength(2);
+      expect(messages[0]).toMatchObject({
+        role: 'user',
+        content: 'Review this diff.',
+      });
+      expect(messages[1]).toMatchObject({
+        role: 'assistant',
+        content: 'The diff looks good.',
+      });
+
+      expect(messages[1].toolCalls).toEqual([
+        expect.objectContaining({
+          id: 'call_1',
+          name: 'Bash',
+          input: { command: 'git diff --stat' },
+          status: 'completed',
+        }),
+      ]);
+
+      // Result should be normalized (Output:\n stripped)
+      expect(messages[1].toolCalls![0].result).toBe(' src/main.ts | 2 +-');
+
+      expect(messages[1].contentBlocks).toEqual([
+        { type: 'thinking', content: 'Thinking through the changes.' },
+        { type: 'tool_use', toolId: 'call_1' },
+        { type: 'text', content: 'The diff looks good.' },
+      ]);
+    });
+
+    it('deduplicates the same user message when both response_item and event_msg are persisted', () => {
+      const content = [
+        JSON.stringify({
+          timestamp: '2026-03-27T00:00:00.000Z',
+          type: 'response_item',
+          payload: {
+            type: 'message',
+            role: 'user',
+            content: [{ type: 'input_text', text: 'hi' }],
+          },
+        }),
+        JSON.stringify({
+          timestamp: '2026-03-27T00:00:00.001Z',
+          type: 'event_msg',
+          payload: {
+            type: 'user_message',
+            message: 'hi',
+          },
+        }),
+        JSON.stringify({
+          timestamp: '2026-03-27T00:00:01.000Z',
+          type: 'event_msg',
+          payload: {
+            type: 'agent_message',
+            message: 'Hello there.',
+          },
+        }),
+        JSON.stringify({
+          timestamp: '2026-03-27T00:00:01.001Z',
+          type: 'response_item',
+          payload: {
+            type: 'message',
+            role: 'assistant',
+            content: [{ type: 'output_text', text: 'Hello there.' }],
+          },
+        }),
+      ].join('\n');
+
+      const messages = parseCodexSessionContent(content);
+
+      expect(messages).toEqual([
+        expect.objectContaining({
+          role: 'user',
+          content: 'hi',
+        }),
+        expect.objectContaining({
+          role: 'assistant',
+          content: 'Hello there.',
+        }),
+      ]);
+    });
+  });
+
+  describe('parseCodexSessionFileAsync - persisted tools', () => {
+    it('restores exec_command as Bash with normalized result', async () => {
+      const filePath = path.join(FIXTURES_DIR, 'codex-session-persisted-tools.jsonl');
+      const messages = await parseCodexSessionFileAsync(filePath);
+
+      const assistantMsg = messages.find(m => m.role === 'assistant' && m.toolCalls);
+      expect(assistantMsg).toBeDefined();
+
+      const bashTool = assistantMsg!.toolCalls!.find(tc => tc.name === 'Bash');
+      expect(bashTool).toBeDefined();
+      expect(bashTool!.id).toBe('call_exec_1');
+      expect(bashTool!.input).toEqual({ command: 'cat src/main.ts' });
+      expect(bashTool!.status).toBe('completed');
+      // Result should be normalized: "Output:\n" prefix stripped
+      expect(bashTool!.result).toBe("import { Plugin } from 'obsidian';");
+    });
+
+    it('restores custom_tool_call apply_patch as native apply_patch', async () => {
+      const filePath = path.join(FIXTURES_DIR, 'codex-session-persisted-tools.jsonl');
+      const messages = await parseCodexSessionFileAsync(filePath);
+
+      const assistantMsg = messages.find(m => m.role === 'assistant' && m.toolCalls);
+      const patchTool = assistantMsg!.toolCalls!.find(tc => tc.name === 'apply_patch');
+      expect(patchTool).toBeDefined();
+      expect(patchTool!.id).toBe('call_patch_1');
+      expect(patchTool!.input.patch).toContain('Update File: src/main.ts');
+      expect(patchTool!.status).toBe('completed');
+    });
+
+    it('restores completed exec envelopes as their nested tools', () => {
+      const patch = '*** Begin Patch\n*** Update File: note.md\n*** End Patch';
+      const content = [
+        JSON.stringify({
+          timestamp: testTime({ seconds: 0 }),
+          type: 'event_msg',
+          payload: { type: 'task_started' },
+        }),
+        JSON.stringify({
+          timestamp: testTime({ seconds: 1 }),
+          type: 'response_item',
+          payload: {
+            type: 'custom_tool_call',
+            name: 'exec',
+            call_id: 'call_exec_wrapper',
+            input: 'const r = await tools.exec_command({cmd:"ls -1",workdir:"/vault"}); text(r.output.toUpperCase());',
+          },
+        }),
+        JSON.stringify({
+          timestamp: testTime({ seconds: 2 }),
+          type: 'response_item',
+          payload: {
+            type: 'custom_tool_call_output',
+            call_id: 'call_exec_wrapper',
+            output: [
+              { type: 'input_text', text: 'Script completed\nWall time 0.1 seconds\nOutput:\n' },
+              { type: 'input_text', text: 'FILE.TXT\n' },
+            ],
+          },
+        }),
+        JSON.stringify({
+          timestamp: testTime({ seconds: 3 }),
+          type: 'response_item',
+          payload: {
+            type: 'custom_tool_call',
+            name: 'exec',
+            call_id: 'call_patch_wrapper',
+            input: `const patch = ${JSON.stringify(patch)};\ntext(await tools.apply_patch(patch));`,
+          },
+        }),
+        JSON.stringify({
+          timestamp: testTime({ seconds: 4 }),
+          type: 'response_item',
+          payload: {
+            type: 'custom_tool_call_output',
+            call_id: 'call_patch_wrapper',
+            output: [{ type: 'input_text', text: 'Script completed\nOutput:\nApplied patch' }],
+          },
+        }),
+        JSON.stringify({ timestamp: testTime({ seconds: 5 }), type: 'event_msg', payload: { type: 'item_completed', item: {
+          type: 'CommandExecution', id: 'native-command', command: ['zsh', '-lc', 'ls -1'], cwd: '/vault', aggregated_output: 'file.txt\n', exit_code: 0,
+        } } }),
+      ].join('\n');
+
+      const messages = parseCodexSessionContent(content);
+      const toolCalls = messages.flatMap(message => message.toolCalls ?? []);
+
+      expect(toolCalls).toEqual(expect.arrayContaining([
+        expect.objectContaining({
+          id: 'call_exec_wrapper',
+          name: 'Bash',
+          input: { command: 'ls -1' },
+          status: 'completed',
+          result: 'FILE.TXT\n',
+        }),
+        expect.objectContaining({
+          id: 'call_patch_wrapper',
+          name: 'apply_patch',
+          input: { patch },
+          status: 'completed',
+        }),
+      ]));
+    });
+
+    it('withholds script output that cannot be separated from hidden internal values, keeping native command output', () => {
+      const cwd = path.resolve('/workspace');
+      const scriptOutput = (status: string, ...texts: string[]) => [
+        { type: 'input_text', text: `Script ${status}\nWall time 0.1 seconds\nOutput:\n` },
+        ...texts.map(text => ({ type: 'input_text', text })),
+      ];
+      const script = (id: string, input: string, output: unknown[]) => [
+        { type: 'response_item', payload: { type: 'custom_tool_call', name: 'exec', call_id: id, input } },
+        { type: 'response_item', payload: { type: 'custom_tool_call_output', call_id: id, output } },
+      ];
+      const command = JSON.stringify({ chunk_id: 'c1', wall_time_seconds: 0.1, exit_code: 0, output: 'public output' });
+      const nativeCommand = (id: string, cmd: string, cwd: string, exitCode = 0) => ({ type: 'event_msg', payload: { type: 'item_completed', item: {
+        type: 'CommandExecution', id, command: ['/bin/zsh', '-lc', cmd], parsed_cmd: [{ type: 'unknown', cmd }], cwd,
+        aggregated_output: `native ${cmd} output\n`, exit_code: exitCode, status: exitCode === 0 ? 'completed' : 'failed',
+      } } });
+      const mixed = (id: string, request: string) => script(id, `const visible = await tools.exec_command(${request}); const internal = await tools.get_context_remaining({}); text(internal); text(visible);`,
+        scriptOutput('completed', 'opaque-internal-payload', command));
+      const reversed = mixed('reversed', '{cmd:"public"}');
+      const failing = mixed('failing', '{cmd:"check"}');
+      const elsewhere = mixed('elsewhere', '{cmd:"pwd",workdir:"sub"}');
+      const records = [
+        { type: 'turn_context', payload: { cwd } },
+        // Part count matches the calls, but emission order differs from call order.
+        // The native command item still identifies the visible call's own output.
+        reversed[0], nativeCommand('exec-public', 'public', pathToFileURL(cwd).href), reversed[1],
+        // Script completion must not override the native command failure.
+        failing[0], nativeCommand('exec-check', 'check', cwd, 7), failing[1],
+        // The same command run in another directory is a different request.
+        elsewhere[0], nativeCommand('exec-pwd', 'pwd', cwd), elsewhere[1],
+        ...script('failed-internal', 'text(await tools.get_context_remaining({})); throw new Error("later failure");',
+          scriptOutput('failed', 'opaque-internal-payload\nlater failure')),
+        ...script('failed-mixed', 'text(await tools.get_context_remaining({})); text(await tools.exec_command({cmd:"public"})); throw new Error("later failure");',
+          scriptOutput('failed', 'opaque-internal-payload\nlater failure')),
+      ];
+      const tools = parseCodexSessionContent(records.map((record, seconds) => JSON.stringify({ timestamp: testTime({ seconds }), ...record })).join('\n'))
+        .flatMap(message => message.toolCalls ?? []);
+
+      expect(tools.map(tool => [tool.id, tool.name, tool.status, tool.result])).toEqual([
+        ['reversed:1', 'Bash', 'completed', 'native public output\n'],
+        ['failing:1', 'Bash', 'error', 'native check output\n'],
+        ['elsewhere:1', 'Bash', 'completed', undefined],
+        ['failed-mixed', 'exec', 'error', undefined],
+      ]);
+      expect(JSON.stringify(tools)).not.toContain('opaque-internal-payload');
+    });
+
+    it.each(['custom_tool_call', 'function_call'])('preserves failed %s exec scripts without inventing nested executions', (callType) => {
+      const script = 'text(await tools.apply_patch("invalid patch")); text(await tools.exec_command({cmd:"never runs"}));';
+      const error = 'Script error:\napply_patch verification failed: missing expected lines';
+      const content = [
+        { type: 'event_msg', payload: { type: 'task_started', turn_id: 'failed-script-turn' } },
+        { type: 'response_item', payload: { type: callType, name: 'exec', call_id: 'failed-script', input: script } },
+        { type: 'response_item', payload: { type: `${callType}_output`, call_id: 'failed-script', output: [
+          { type: 'input_text', text: 'Script failed\nWall time 0.0 seconds\nOutput:\n' },
+          { type: 'input_text', text: error },
+        ] } },
+        { type: 'event_msg', payload: { type: 'task_complete', turn_id: 'failed-script-turn' } },
+      ].map((record, seconds) => JSON.stringify({ timestamp: testTime({ seconds }), ...record })).join('\n');
+
+      const messages = parseCodexSessionContent(content);
+      expect(messages.flatMap(message => message.toolCalls ?? [])).toEqual([
+        expect.objectContaining({ id: 'failed-script', name: 'exec', input: { raw: script }, status: 'error', result: expect.stringContaining(error) }),
+      ]);
+      expect(messages.flatMap(message => message.contentBlocks ?? [])).toEqual([
+        { type: 'tool_use', toolId: 'failed-script' },
+      ]);
+    });
+
+    it.each([
+      { exitCode: 0, status: 'completed', settled: false },
+      { exitCode: 1, status: 'error', settled: false },
+      { exitCode: -1, status: 'error', settled: false },
+      { exitCode: 2, status: 'error', settled: true },
+    ])('restores structured command exit code $exitCode through direct and exec outputs (settled: $settled)', ({ exitCode, status, settled }) => {
+      const metadata = { output: 'command output', exit_code: exitCode, wall_time_seconds: 1 };
+      const result = JSON.stringify(settled ? { status: 'fulfilled', value: metadata } : metadata);
+      const content = [
+        { type: 'event_msg', payload: { type: 'task_started' } },
+        { type: 'response_item', payload: { type: 'function_call', name: 'exec_command', call_id: 'direct', arguments: '{"cmd":"check"}' } },
+        { type: 'response_item', payload: { type: 'function_call_output', call_id: 'direct', output: result } },
+        { type: 'response_item', payload: { type: 'custom_tool_call', name: 'exec', call_id: 'wrapped', input: 'text(await tools.exec_command({cmd:"check"}));' } },
+        { type: 'response_item', payload: { type: 'custom_tool_call_output', call_id: 'wrapped', output: [
+          { type: 'input_text', text: 'Script completed\nWall time 1.0 seconds\nOutput:\n' },
+          { type: 'input_text', text: result },
+        ] } },
+        { type: 'event_msg', payload: { type: 'task_complete' } },
+      ].map((record, seconds) => JSON.stringify({ timestamp: testTime({ seconds }), ...record })).join('\n');
+
+      expect(parseCodexSessionContent(content).flatMap(message => message.toolCalls ?? [])).toEqual([
+        expect.objectContaining({ id: 'direct', status, result: 'command output' }),
+        expect.objectContaining({ id: 'wrapped', status, result: 'command output' }),
+      ]);
+    });
+
+    it.each([
+      { label: 'non-fulfilled status', value: { status: 'pending', value: { output: 'nested application data' } } },
+      { label: 'fulfilled status without command metadata', value: { status: 'fulfilled', value: { report: 'application data' } } },
+    ])('preserves ordinary command JSON output with $label', ({ value }) => {
+      const output = JSON.stringify(value);
+      const records = [
+        { type: 'response_item', payload: { type: 'function_call', name: 'exec_command', call_id: 'command', arguments: '{"cmd":"cat report.json"}' } },
+        { type: 'response_item', payload: { type: 'function_call_output', call_id: 'command', output } },
+      ];
+      expect(parseCodexSessionContent(records.map((record, seconds) => JSON.stringify({ timestamp: testTime({ seconds }), ...record })).join('\n')).flatMap(message => message.toolCalls ?? []))
+        .toEqual([expect.objectContaining({ id: 'command', result: output })]);
+    });
+
+    it.each([42, '42'])('joins terminal session %j polling output to its running command and restores its failure', sessionId => {
+      const records = [
+        { type: 'event_msg', payload: { type: 'task_started' } },
+        { type: 'response_item', payload: { type: 'function_call', name: 'exec_command', call_id: 'command', arguments: '{"cmd":"long check"}' } },
+        { type: 'response_item', payload: { type: 'function_call_output', call_id: 'command', output: JSON.stringify({ output: 'started', exit_code: null, session_id: 42 }) } },
+        { type: 'response_item', payload: { type: 'function_call', name: 'write_stdin', call_id: 'poll', arguments: JSON.stringify({ session_id: sessionId, chars: '' }) } },
+        { type: 'response_item', payload: { type: 'function_call_output', call_id: 'poll', output: 'progress' } },
+        { type: 'response_item', payload: { type: 'function_call', name: 'write_stdin', call_id: 'final-poll', arguments: JSON.stringify({ session_id: sessionId, chars: '' }) } },
+        { type: 'response_item', payload: { type: 'function_call_output', call_id: 'final-poll', output: JSON.stringify({ output: 'failed', exit_code: 2 }) } },
+        { type: 'event_msg', payload: { type: 'task_complete' } },
+      ];
+      const serialize = (entries: typeof records) => entries.map((record, seconds) => JSON.stringify({ timestamp: testTime({ seconds }), ...record })).join('\n');
+
+      expect(parseCodexSessionContent(serialize(records.slice(0, 3))).flatMap(message => message.toolCalls ?? [])).toEqual([
+        expect.objectContaining({ id: 'command', status: 'running', result: 'started' }),
+      ]);
+      expect(parseCodexSessionContent(serialize(records.slice(0, 5))).flatMap(message => message.toolCalls ?? [])).toEqual([
+        expect.objectContaining({ id: 'command', status: 'running', result: 'started\nprogress' }),
+      ]);
+      expect(parseCodexSessionContent(serialize(records)).flatMap(message => message.toolCalls ?? [])).toEqual([
+        expect.objectContaining({ id: 'command', status: 'error', result: 'started\nprogress\nfailed' }),
+      ]);
+    });
+
+    it.each([
+      ['direct', 0, 'completed'],
+      ['direct', 2, 'error'],
+      ['wrapped', 0, 'completed'],
+      ['wrapped', 2, 'error'],
+    ])('retains %s polling output after a multi-command script exits with %s', (shape, exitCode, status) => {
+      const initialOutput = JSON.stringify({ output: 'first passed', exit_code: 0 })
+        + JSON.stringify({ output: 'second started', session_id: 42 });
+      const pollResult = JSON.stringify({ output: 'second finished', exit_code: exitCode });
+      const records = [
+        { type: 'event_msg', payload: { type: 'task_started' } },
+        { type: 'response_item', payload: { type: 'custom_tool_call', name: 'exec', call_id: 'batch', input: 'text(await tools.exec_command({cmd:"first"})); text(await tools.exec_command({cmd:"second"}));' } },
+        { type: 'response_item', payload: { type: 'custom_tool_call_output', call_id: 'batch', output: initialOutput } },
+        { type: 'response_item', payload: shape === 'direct'
+          ? { type: 'function_call', name: 'write_stdin', call_id: 'poll', arguments: '{"session_id":42,"chars":""}' }
+          : { type: 'custom_tool_call', name: 'exec', call_id: 'poll', input: 'text(await tools.write_stdin({session_id:42,chars:""}));' } },
+        { type: 'response_item', payload: { type: shape === 'direct' ? 'function_call_output' : 'custom_tool_call_output', call_id: 'poll', output: shape === 'direct' ? pollResult : 'Script completed\nWall time 0.1 seconds\nOutput:\n' + pollResult } },
+        { type: 'event_msg', payload: { type: 'task_complete' } },
+      ];
+      const messages = parseCodexSessionContent(records.map((record, seconds) => JSON.stringify({ timestamp: testTime({ seconds }), ...record })).join('\n'));
+      expect(messages.flatMap(message => message.toolCalls ?? [])).toEqual([
+        expect.objectContaining({ id: 'batch:1', name: 'Bash' }),
+        expect.objectContaining({ id: 'batch:2', name: 'Bash' }),
+        expect.objectContaining({ id: 'batch', name: 'exec', result: initialOutput }),
+        expect.objectContaining({ id: 'poll', name: 'write_stdin', input: { session_id: 42, chars: '' }, status, result: 'second finished' }),
+      ]);
+      expect(messages.flatMap(message => message.toolCalls ?? []).slice(0, 2).map(tool => tool.result)).toEqual([undefined, undefined]);
+      expect(messages.flatMap(message => message.contentBlocks ?? [])).toContainEqual({ type: 'tool_use', toolId: 'poll' });
+    });
+
+    it.each([
+      ['plain output', 'new output', 'new output', 'completed'],
+      ['wrapped error', 'Script completed\nOutput:\nError: Unknown session 42', 'Error: Unknown session 42', 'error'],
+      ['empty failure', JSON.stringify({ output: '', exit_code: -1 }), '', 'error'],
+      ['structured acknowledgement text', JSON.stringify({ output: 'Input sent.', exit_code: 0 }), 'Input sent.', 'completed'],
+      ['running terminal', JSON.stringify({ output: 'still working', session_id: 42 }), 'still working', 'completed'],
+      ['textual failure', 'Process exited with code 2\nOutput:\nfailed', 'failed', 'error'],
+    ])('retains an unresolved poll with %s under its own identity', (_label, output, result, status) => {
+      const records = [
+        { type: 'event_msg', payload: { type: 'task_started' } },
+        { type: 'response_item', payload: { type: 'function_call', name: 'write_stdin', call_id: 'poll', arguments: '{"session_id":42,"chars":""}' } },
+        { type: 'response_item', payload: { type: 'function_call_output', call_id: 'poll', output } },
+      ];
+      const messages = parseCodexSessionContent(records.map((record, seconds) => JSON.stringify({ timestamp: testTime({ seconds }), ...record })).join('\n'));
+      expect(messages.flatMap(message => message.toolCalls ?? [])).toEqual([
+        expect.objectContaining({ id: 'poll', name: 'write_stdin', input: { session_id: 42, chars: '' }, result, status }),
+      ]);
+    });
+
+    it('keeps a delayed unresolved poll in its original assistant bubble and turn', () => {
+      const records = [
+        { type: 'event_msg', payload: { type: 'task_started', turn_id: 'first' } },
+        { type: 'response_item', payload: { type: 'function_call', name: 'write_stdin', call_id: 'poll', arguments: '{"session_id":42,"chars":""}' } },
+        { type: 'event_msg', payload: { type: 'agent_message', message: 'Checking.' } },
+        { type: 'event_msg', payload: { type: 'task_complete', turn_id: 'first' } },
+        { type: 'event_msg', payload: { type: 'task_started', turn_id: 'second' } },
+        { type: 'event_msg', payload: { type: 'agent_message', message: 'Next turn.' } },
+        { type: 'response_item', payload: { type: 'function_call_output', call_id: 'poll', output: JSON.stringify({ output: 'late failure', exit_code: 1 }) } },
+        { type: 'event_msg', payload: { type: 'task_complete', turn_id: 'second' } },
+      ];
+      const turns = parseCodexSessionTurns(records.map((record, seconds) => JSON.stringify({ timestamp: testTime({ seconds }), ...record })).join('\n'));
+      expect(turns).toHaveLength(2);
+      expect(turns[0].messages).toEqual([
+        expect.objectContaining({ content: 'Checking.', toolCalls: [expect.objectContaining({ id: 'poll', result: 'late failure', status: 'error' })], contentBlocks: [
+          { type: 'tool_use', toolId: 'poll' },
+          { type: 'text', content: 'Checking.' },
+        ] }),
+      ]);
+      expect(turns[1].messages).toEqual([expect.objectContaining({ content: 'Next turn.', toolCalls: undefined })]);
+    });
+
+    it('retains a wait for an unknown script cell instead of attributing it to a command', () => {
+      const records = [
+        { type: 'event_msg', payload: { type: 'task_started' } },
+        { type: 'response_item', payload: { type: 'function_call', name: 'wait', call_id: 'unknown-wait', arguments: '{"cell_id":"prior-cell"}' } },
+        { type: 'response_item', payload: { type: 'function_call_output', call_id: 'unknown-wait', output: 'Script completed\nWall time 0.1 seconds\nOutput:\nRecovered output' } },
+      ];
+      const tools = parseCodexSessionContent(records.map((record, seconds) => JSON.stringify({ timestamp: testTime({ seconds }), ...record })).join('\n'))
+        .flatMap(message => message.toolCalls ?? []);
+      expect(tools).toEqual([expect.objectContaining({ id: 'unknown-wait', name: 'wait', status: 'completed', result: 'Script completed\nWall time 0.1 seconds\nOutput:\nRecovered output' })]);
+    });
+
+    it('retains an unresolved polling wrapper through its yielded script cell', () => {
+      const records = [
+        { type: 'event_msg', payload: { type: 'task_started' } },
+        { type: 'response_item', payload: { type: 'custom_tool_call', name: 'exec', call_id: 'poll', input: 'text(await tools.write_stdin({session_id:42,chars:""}));' } },
+        { type: 'response_item', payload: { type: 'custom_tool_call_output', call_id: 'poll', output: 'Script running with cell ID poll-cell\nOutput:\n' } },
+        { type: 'response_item', payload: { type: 'function_call', name: 'wait', call_id: 'wait-poll', arguments: '{"cell_id":"poll-cell"}' } },
+        { type: 'response_item', payload: { type: 'function_call_output', call_id: 'wait-poll', output: 'Script completed\nOutput:\n' + JSON.stringify({ output: 'late failure', exit_code: 2 }) } },
+      ];
+      const serialize = (entries: typeof records) => entries.map((record, seconds) => JSON.stringify({ timestamp: testTime({ seconds }), ...record })).join('\n');
+      expect(parseCodexSessionContent(serialize(records.slice(0, 3))).flatMap(message => message.toolCalls ?? [])).toEqual([
+        expect.objectContaining({ id: 'poll', name: 'write_stdin', status: 'running' }),
+      ]);
+      expect(parseCodexSessionContent(serialize(records)).flatMap(message => message.toolCalls ?? [])).toEqual([
+        expect.objectContaining({ id: 'poll', name: 'write_stdin', result: 'late failure', status: 'error' }),
+      ]);
+    });
+
+    it('preserves settled command and polling payloads as script output without guessing their owners', () => {
+      const firstResult = JSON.stringify({ status: 'fulfilled', value: { output: 'first failed', exit_code: 1 } });
+      const secondResult = JSON.stringify({ status: 'fulfilled', value: { output: 'second started', session_id: 42 } });
+      const polledResult = JSON.stringify({ output: 'second failed', exit_code: 2 });
+      const thirdResult = JSON.stringify({ output: 'third passed', exit_code: 0 });
+      const records = [
+        { type: 'event_msg', payload: { type: 'task_started' } },
+        { type: 'response_item', payload: { type: 'custom_tool_call', name: 'exec', call_id: 'batch', input: 'const results = await Promise.allSettled([tools.exec_command({cmd:"first"}), tools.exec_command({cmd:"second"})]); for (const result of results) text(result);' } },
+        { type: 'response_item', payload: { type: 'custom_tool_call_output', call_id: 'batch', output: [
+          { type: 'input_text', text: 'Script completed\nWall time 0.1 seconds\nOutput:\n' },
+          { type: 'input_text', text: firstResult },
+          { type: 'input_text', text: secondResult },
+        ] } },
+        { type: 'response_item', payload: { type: 'custom_tool_call', name: 'exec', call_id: 'poll-batch', input: 'text(await tools.write_stdin({session_id:42,chars:""})); text(await tools.exec_command({cmd:"third"}));' } },
+        { type: 'response_item', payload: { type: 'custom_tool_call_output', call_id: 'poll-batch', output: [
+          { type: 'input_text', text: 'Script completed\nWall time 0.1 seconds\nOutput:\n' },
+          { type: 'input_text', text: polledResult },
+          { type: 'input_text', text: thirdResult },
+        ] } },
+        { type: 'event_msg', payload: { type: 'task_complete' } },
+      ];
+      const content = records.map((record, seconds) => JSON.stringify({ timestamp: testTime({ seconds }), ...record })).join('\n');
+      const messages = parseCodexSessionContent(content);
+      expect(messages.flatMap(message => message.toolCalls ?? []).map(tool => [tool.id, tool.name, tool.result])).toEqual([
+        ['batch:1', 'Bash', undefined],
+        ['batch:2', 'Bash', undefined],
+        ['batch', 'exec', firstResult + secondResult],
+        ['poll-batch:2', 'Bash', undefined],
+        ['poll-batch', 'exec', polledResult + thirdResult],
+      ]);
+      expect(messages.flatMap(message => message.contentBlocks ?? [])).toEqual([
+        { type: 'tool_use', toolId: 'batch:1' },
+        { type: 'tool_use', toolId: 'batch:2' },
+        { type: 'tool_use', toolId: 'batch' },
+        { type: 'tool_use', toolId: 'poll-batch:2' },
+        { type: 'tool_use', toolId: 'poll-batch' },
+      ]);
+    });
+
+    it.each(['absent', 'before', 'after', 'script error'] as const)(
+      'keeps reordered script output separate from command results: %s', nativePosition => {
+        const source = [
+          'const first = await tools.exec_command({cmd:"printf FIRST"});',
+          nativePosition === 'before'
+            ? 'const second = await tools.exec_command({cmd:"printf SECOND",workdir:"subdir"});'
+            : 'const second = await tools.exec_command({cmd:"printf SECOND"});',
+          'text(second.output); text(first.output);',
+        ].join('\n');
+        const native = { type: 'event_msg', payload: { type: 'item_completed', item: {
+          type: 'CommandExecution', id: 'native-second', command: ['/bin/zsh', '-lc', 'printf SECOND'],
+          parsed_cmd: [{ cmd: "printf 'SECOND'" }], cwd: pathToFileURL(nativePosition === 'before' ? '/vault/subdir' : '/vault').href, aggregated_output: 'Native second result', exit_code: 7,
+        } } };
+        const records = [
+          { type: 'turn_context', payload: { cwd: '/vault/.' } },
+          { type: 'response_item', payload: { type: 'function_call', name: 'view_image', call_id: 'unrelated', arguments: '{"path":"/tmp/preview.png"}' } },
+          { type: 'response_item', payload: { type: 'custom_tool_call', name: 'exec', call_id: 'reordered', input: source } },
+          ...(nativePosition === 'before' ? [native] : []),
+          { type: 'response_item', payload: { type: 'custom_tool_call_output', call_id: 'reordered', output: nativePosition === 'script error' ? 'Error: execution cancelled' : [
+            { type: 'input_text', text: 'Script completed\nWall time 0.1 seconds\nOutput:\n' },
+            { type: 'input_text', text: 'SECOND\n' },
+            { type: 'input_text', text: 'FIRST\n' },
+          ] } },
+          ...(nativePosition === 'after' ? [native] : []),
+        ];
+        const tools = parseCodexSessionContent(records.map((record, seconds) => JSON.stringify({
+          timestamp: testTime({ seconds }), ...record,
+        })).join('\n')).flatMap(message => message.toolCalls ?? []);
+
+        expect(tools.map(tool => [tool.id, tool.name, tool.status, tool.result])).toEqual([
+          ['unrelated', 'Read', 'running', undefined],
+          ['reordered:1', 'Bash', nativePosition === 'script error' ? 'error' : 'completed', undefined],
+          ['reordered:2', 'Bash', nativePosition === 'absent' ? 'completed' : 'error',
+            nativePosition === 'absent' || nativePosition === 'script error' ? undefined : 'Native second result'],
+          ['reordered', 'exec', nativePosition === 'script error' ? 'error' : 'completed', nativePosition === 'script error' ? 'Error: execution cancelled' : 'SECOND\nFIRST\n'],
+        ]);
+        expect(tools.find(tool => tool.id === 'reordered')?.input).toEqual({ raw: source });
+      },
+    );
+
+    it.each([
+      ['single script', 'single first'],
+      ['single script', 'batch first'],
+      ['direct command', 'single first'],
+      ['direct command', 'batch first'],
+      ['dynamic script', 'single first'],
+      ['dynamic script', 'batch first'],
+    ])('does not guess native ownership for a concurrent %s with matching command and cwd (%s)', (kind, order) => {
+      const call = kind === 'direct command'
+        ? { type: 'function_call', name: 'exec_command', call_id: 'single', arguments: '{"cmd":"same"}' }
+        : { type: 'custom_tool_call', name: 'exec', call_id: 'single', input: kind === 'dynamic script'
+          ? 'const cmd = "same"; text(await tools.exec_command({cmd}));'
+          : 'text(await tools.exec_command({cmd:"same"}));' };
+      const singleOutput = JSON.stringify({ output: 'SINGLE failed', exit_code: 7 });
+      const native = (id: string, output: string, exitCode: number) => ({ type: 'event_msg', payload: {
+        type: 'item_completed', item: {
+          type: 'CommandExecution', id, command: ['/bin/zsh', '-lc', 'same'], cwd: '/vault',
+          aggregated_output: output, exit_code: exitCode,
+        },
+      } });
+      const singleNative = native('native-single', 'SINGLE failed', 7);
+      const batchNative = native('native-batch', 'BATCH passed', 0);
+      const records = [
+        { type: 'turn_context', payload: { cwd: '/vault' } },
+        { type: 'response_item', payload: { type: 'custom_tool_call', name: 'exec', call_id: 'batch',
+          input: 'const first = await tools.exec_command({cmd:"same"}); const second = await tools.exec_command({cmd:"other"}); text(first); text(second);' } },
+        { type: 'response_item', payload: { type: 'custom_tool_call_output', call_id: 'batch',
+          output: 'Script running with cell ID 42\nOutput:\n' } },
+        { type: 'response_item', payload: call },
+        order === 'single first' ? singleNative : batchNative,
+        { type: 'response_item', payload: { type: `${call.type}_output`, call_id: 'single',
+          output: singleOutput } },
+        order === 'single first' ? batchNative : singleNative,
+      ];
+      const tools = parseCodexSessionContent(records.map((record, seconds) => JSON.stringify({
+        timestamp: testTime({ seconds }), ...record,
+      })).join('\n')).flatMap(message => message.toolCalls ?? []);
+
+      expect(tools.find(tool => tool.id === 'batch:1')).toMatchObject({ name: 'Bash', status: 'completed' });
+      expect(tools.find(tool => tool.id === 'batch:1')?.result).toBeUndefined();
+      expect(tools.find(tool => tool.id === 'single')).toMatchObject(kind === 'dynamic script'
+        ? { name: 'exec', status: 'completed', result: singleOutput }
+        : { name: 'Bash', status: 'error', result: 'SINGLE failed' });
+      expect(tools.find(tool => tool.id === 'batch')).toMatchObject({ name: 'exec', status: 'running' });
+    });
+
+    it('keeps an opaque script ambiguous through its turn and resumes native attribution in the next turn', () => {
+      const batch = (id: string) => ({ type: 'response_item', payload: {
+        type: 'custom_tool_call', name: 'exec', call_id: id,
+        input: 'text(await tools.exec_command({cmd:"same"})); text(await tools.exec_command({cmd:"other"}));',
+      } });
+      const native = (id: string, output: string) => ({ type: 'event_msg', payload: { type: 'item_completed', item: {
+        type: 'CommandExecution', id, command: ['/bin/zsh', '-lc', 'same'], cwd: '/vault',
+        aggregated_output: output, exit_code: 0,
+      } } });
+      const records = [
+        { type: 'turn_context', payload: { cwd: '/vault' } },
+        { type: 'event_msg', payload: { type: 'task_started', turn_id: 'first' } },
+        { type: 'response_item', payload: { type: 'custom_tool_call', name: 'exec', call_id: 'dynamic',
+          input: 'const cmd = "same"; text(await tools.exec_command({cmd}));' } },
+        native('dynamic-first', 'first opaque result'),
+        { type: 'response_item', payload: { type: 'custom_tool_call_output', call_id: 'dynamic', output: 'Opaque output' } },
+        batch('ambiguous'),
+        native('dynamic-late', 'late opaque result'),
+        { type: 'event_msg', payload: { type: 'task_started', turn_id: 'second' } },
+        batch('identified'),
+        native('identified-native', 'Identified result'),
+      ];
+      const tools = parseCodexSessionContent(records.map((record, seconds) => JSON.stringify({
+        timestamp: testTime({ seconds }), ...record,
+      })).join('\n')).flatMap(message => message.toolCalls ?? []);
+
+      expect(tools.find(tool => tool.id === 'dynamic')).toMatchObject({ name: 'exec', result: 'Opaque output' });
+      expect(tools.find(tool => tool.id === 'ambiguous:1')).toMatchObject({ name: 'Bash' });
+      expect(tools.find(tool => tool.id === 'ambiguous:1')?.result).toBeUndefined();
+      expect(tools.find(tool => tool.id === 'identified:1')).toMatchObject({ name: 'Bash', result: 'Identified result', status: 'completed' });
+    });
+
+    it('retains a prior command as ambiguity evidence when a decoded loop emits more native items', () => {
+      const native = (id: string, output: string, exitCode: number) => ({ type: 'event_msg', payload: { type: 'item_completed', item: {
+        type: 'CommandExecution', id, command: ['/bin/zsh', '-lc', 'same'], cwd: '/vault',
+        aggregated_output: output, exit_code: exitCode,
+      } } });
+      const records = [
+        { type: 'turn_context', payload: { cwd: '/vault' } },
+        { type: 'response_item', payload: { type: 'custom_tool_call', name: 'exec', call_id: 'loop',
+          input: 'for (let index = 0; index < 2; index++) { text(await tools.exec_command({cmd:"same"})); } text(await tools.exec_command({cmd:"other"}));' } },
+        native('loop-first', 'First loop result', 0),
+        { type: 'response_item', payload: { type: 'custom_tool_call_output', call_id: 'loop', output: 'Script running with cell ID 42\nOutput:\n' } },
+        { type: 'response_item', payload: { type: 'custom_tool_call', name: 'exec', call_id: 'batch',
+          input: 'text(await tools.exec_command({cmd:"same"})); text(await tools.exec_command({cmd:"different"}));' } },
+        native('loop-second', 'Second loop failure', 7),
+        native('batch-native', 'Batch result', 0),
+      ];
+      const tools = parseCodexSessionContent(records.map((record, seconds) => JSON.stringify({
+        timestamp: testTime({ seconds }), ...record,
+      })).join('\n')).flatMap(message => message.toolCalls ?? []);
+
+      expect(tools.find(tool => tool.id === 'loop:1')).toMatchObject({ result: 'First loop result', status: 'completed' });
+      expect(tools.find(tool => tool.id === 'batch:1')).toMatchObject({ name: 'Bash', status: 'running' });
+      expect(tools.find(tool => tool.id === 'batch:1')?.result).toBeUndefined();
+    });
+
+    it('restores every command while keeping its uncorrelated output on the script', () => {
+      const content = [
+        JSON.stringify({
+          timestamp: '2026-07-13T00:00:00.000Z',
+          type: 'event_msg',
+          payload: { type: 'task_started' },
+        }),
+        JSON.stringify({
+          timestamp: '2026-07-13T00:00:01.000Z',
+          type: 'response_item',
+          payload: {
+            type: 'custom_tool_call',
+            name: 'exec',
+            call_id: 'call_exec_group',
+            input: [
+              'const first = await tools.exec_command({cmd:"pwd",workdir:"/vault"});',
+              'text(first.output);',
+              'const second = await tools.exec_command({cmd:"printf edit",workdir:"/vault"});',
+              'text(second.output);',
+              'const third = await tools.exec_command({cmd:"wc -l note.md",workdir:"/vault"});',
+              'text(third.output);',
+            ].join('\n'),
+          },
+        }),
+        JSON.stringify({
+          timestamp: '2026-07-13T00:00:02.000Z',
+          type: 'response_item',
+          payload: {
+            type: 'custom_tool_call_output',
+            call_id: 'call_exec_group',
+            output: [
+              { type: 'input_text', text: 'Script completed\nWall time 0.1 seconds\nOutput:\n' },
+              { type: 'input_text', text: '/vault\n' },
+              { type: 'input_text', text: '' },
+              { type: 'input_text', text: '80 note.md\n' },
+            ],
+          },
+        }),
+      ].join('\n');
+
+      const messages = parseCodexSessionContent(content);
+      const assistantMessage = messages.find(message => message.role === 'assistant');
+
+      expect(assistantMessage?.toolCalls).toEqual([
+        expect.objectContaining({
+          id: 'call_exec_group:1',
+          name: 'Bash',
+          input: { command: 'pwd' },
+          status: 'completed',
+        }),
+        expect.objectContaining({
+          id: 'call_exec_group:2',
+          name: 'Bash',
+          input: { command: 'printf edit' },
+          status: 'completed',
+        }),
+        expect.objectContaining({
+          id: 'call_exec_group:3',
+          name: 'Bash',
+          input: { command: 'wc -l note.md' },
+          status: 'completed',
+        }),
+        expect.objectContaining({
+          id: 'call_exec_group',
+          name: 'exec',
+          result: '/vault\n80 note.md\n',
+          status: 'completed',
+        }),
+      ]);
+      expect(assistantMessage?.toolCalls?.slice(0, 3).map(tool => tool.result)).toEqual([undefined, undefined, undefined]);
+      expect(assistantMessage?.contentBlocks).toEqual([
+        { type: 'tool_use', toolId: 'call_exec_group:1' },
+        { type: 'tool_use', toolId: 'call_exec_group:2' },
+        { type: 'tool_use', toolId: 'call_exec_group:3' },
+        { type: 'tool_use', toolId: 'call_exec_group' },
+      ]);
+    });
+
+    it('restores image-view requests and preserves the emitted images on the script', () => {
+      const content = [
+        JSON.stringify({
+          timestamp: '2026-07-13T00:00:00.000Z',
+          type: 'event_msg',
+          payload: { type: 'task_started' },
+        }),
+        JSON.stringify({
+          timestamp: '2026-07-13T00:00:01.000Z',
+          type: 'response_item',
+          payload: {
+            type: 'custom_tool_call',
+            name: 'exec',
+            call_id: 'call_image_group',
+            input: [
+              'const first = await tools.view_image({path:"/tmp/first.png",detail:"original"});',
+              'image(first.image_url);',
+              'const second = await tools.view_image({path:"/tmp/second.png",detail:"original"});',
+              'image(second.image_url);',
+            ].join('\n'),
+          },
+        }),
+        JSON.stringify({
+          timestamp: '2026-07-13T00:00:02.000Z',
+          type: 'response_item',
+          payload: {
+            type: 'custom_tool_call_output',
+            call_id: 'call_image_group',
+            output: [
+              { type: 'input_text', text: 'Script completed\nWall time 0.0 seconds\nOutput:\n' },
+              { type: 'input_image', image_url: 'data:image/png;base64,Zmlyc3Q=' },
+              { type: 'input_image', image_url: 'data:image/png;base64,c2Vjb25k' },
+            ],
+          },
+        }),
+      ].join('\n');
+
+      const messages = parseCodexSessionContent(content);
+      const assistantMessage = messages.find(message => message.role === 'assistant');
+
+      expect(assistantMessage?.toolCalls).toEqual([
+        expect.objectContaining({
+          id: 'call_image_group:1',
+          name: 'Read',
+          input: expect.objectContaining({ file_path: '/tmp/first.png' }),
+          status: 'completed',
+        }),
+        expect.objectContaining({
+          id: 'call_image_group:2',
+          name: 'Read',
+          input: expect.objectContaining({ file_path: '/tmp/second.png' }),
+          status: 'completed',
+        }),
+        expect.objectContaining({
+          id: 'call_image_group',
+          name: 'exec',
+          result: '',
+          resultImages: [
+            { kind: 'data', mediaType: 'image/png', data: 'Zmlyc3Q=' },
+            { kind: 'data', mediaType: 'image/png', data: 'c2Vjb25k' },
+          ],
+          status: 'completed',
+        }),
+      ]);
+    });
+
+    it('keeps image-only script output bytes out of the result text', () => {
+      const record = (seconds: number, payload: Record<string, unknown>) => JSON.stringify({
+        timestamp: testDate({ seconds }).toISOString(), type: 'response_item', payload,
+      });
+      const messages = parseCodexSessionContent([
+        record(0, { type: 'custom_tool_call', name: 'exec', call_id: 'image_only', input: 'image(globalThis.screenshot);' }),
+        record(1, { type: 'custom_tool_call_output', call_id: 'image_only', output: [
+          { type: 'input_image', image_url: 'data:image/png;base64,aW1hZ2VCeXRlcw==' },
+        ] }),
+      ].join('\n'));
+      const script = messages.flatMap(message => message.toolCalls ?? []).find(tool => tool.id === 'image_only');
+
+      expect(script).toMatchObject({
+        result: '',
+        resultImages: [{ kind: 'data', mediaType: 'image/png', data: 'aW1hZ2VCeXRlcw==' }],
+      });
+    });
+
+    it.each([
+      ['completed', 'Script completed\nWall time 0.1 seconds\nOutput:\nfinished'],
+      ['error', 'Script failed\nWall time 0.1 seconds\nOutput:\nScript error: fixture failure'],
+    ])('restores an undecoded script and its cell waits as one %s tool', (status, finalOutput) => {
+      const source = 'const values = [1, 2]; text(values.map(n => n * 2));';
+      const records: Array<Record<string, unknown>> = [];
+      const add = (payload: Record<string, unknown>) => records.push({
+        timestamp: testTime({ seconds: records.length }), type: 'response_item', payload,
+      });
+      add({ type: 'custom_tool_call', name: 'exec', call_id: 'script', input: source });
+      add({ type: 'custom_tool_call_output', call_id: 'script',
+        output: 'Script running with cell ID 42\nWall time 0.1 seconds\nOutput:\nstarted' });
+      const readTools = () => parseCodexSessionContent(records.map(record => JSON.stringify(record)).join('\n'))
+        .flatMap(message => message.toolCalls ?? []);
+      expect(readTools()).toEqual([expect.objectContaining({
+        name: 'exec', status: 'running', result: 'started', input: { raw: source },
+      })]);
+      add({ type: 'function_call', name: 'wait', call_id: 'wait1', arguments: '{"cell_id":"42"}' });
+      add({ type: 'function_call_output', call_id: 'wait1',
+        output: 'Script running with cell ID 43\nWall time 0.1 seconds\nOutput:\nstill running' });
+      expect(readTools()).toEqual([expect.objectContaining({ status: 'running', result: 'started\nstill running' })]);
+      add({ type: 'function_call', name: 'wait', call_id: 'wait2', arguments: '{"cell_id":"43"}' });
+      add({ type: 'function_call_output', call_id: 'wait2', output: finalOutput });
+      expect(readTools()).toEqual([expect.objectContaining({
+        id: 'script', name: 'exec', status,
+        result: `started\nstill running\n${status === 'error' ? 'Script error: fixture failure' : 'finished'}`,
+      })]);
+    });
+
+    it('restores yielded exec envelopes as one completed Bash tool', () => {
+      const content = [
+        JSON.stringify({
+          timestamp: '2026-07-10T00:00:00.000Z',
+          type: 'event_msg',
+          payload: { type: 'task_started' },
+        }),
+        JSON.stringify({
+          timestamp: '2026-07-10T00:00:01.000Z',
+          type: 'response_item',
+          payload: {
+            type: 'custom_tool_call',
+            name: 'exec',
+            call_id: 'call_exec_wrapper',
+            input: 'const r = await tools.exec_command({cmd:"npm test"}); text(r.output);',
+          },
+        }),
+        JSON.stringify({
+          timestamp: '2026-07-10T00:00:02.000Z',
+          type: 'response_item',
+          payload: {
+            type: 'custom_tool_call_output',
+            call_id: 'call_exec_wrapper',
+            output: [
+              { type: 'input_text', text: 'Script running with cell ID 42\nWall time 10.0 seconds\nOutput:\n' },
+              { type: 'input_text', text: 'tests started\n' },
+            ],
+          },
+        }),
+        JSON.stringify({
+          timestamp: '2026-07-10T00:00:03.000Z',
+          type: 'response_item',
+          payload: {
+            type: 'function_call',
+            name: 'wait',
+            call_id: 'call_wait_1',
+            arguments: '{"cell_id":"42","yield_time_ms":30000}',
+          },
+        }),
+        JSON.stringify({
+          timestamp: '2026-07-10T00:00:04.000Z',
+          type: 'response_item',
+          payload: {
+            type: 'function_call_output',
+            call_id: 'call_wait_1',
+            output: [
+              { type: 'input_text', text: 'Script running with cell ID 42\nWall time 30.0 seconds\nOutput:\n' },
+              { type: 'input_text', text: 'tests still running\n' },
+            ],
+          },
+        }),
+        JSON.stringify({
+          timestamp: '2026-07-10T00:00:05.000Z',
+          type: 'response_item',
+          payload: {
+            type: 'function_call',
+            name: 'wait',
+            call_id: 'call_wait_2',
+            arguments: '{"cell_id":"42","yield_time_ms":30000}',
+          },
+        }),
+        JSON.stringify({
+          timestamp: '2026-07-10T00:00:06.000Z',
+          type: 'response_item',
+          payload: {
+            type: 'function_call_output',
+            call_id: 'call_wait_2',
+            output: [
+              { type: 'input_text', text: 'Script completed\nWall time 0.1 seconds\nOutput:\n' },
+              { type: 'input_text', text: 'tests passed\n' },
+            ],
+          },
+        }),
+      ].join('\n');
+
+      const messages = parseCodexSessionContent(content);
+      const toolCalls = messages.flatMap(message => message.toolCalls ?? []);
+
+      expect(toolCalls).toEqual([expect.objectContaining({
+        id: 'call_exec_wrapper',
+        name: 'Bash',
+        input: { command: 'npm test' },
+        status: 'completed',
+        result: 'tests started\ntests still running\ntests passed\n',
+      })]);
+    });
+
+    it.each(['Applied', 'Error: patch rejected'])('restores raw apply_patch input and its result: %s', output => {
+      const content = [
+        JSON.stringify({
+          timestamp: testTime({ seconds: 0 }),
+          type: 'event_msg',
+          payload: { type: 'task_started' },
+        }),
+        JSON.stringify({
+          timestamp: testTime({ seconds: 1 }),
+          type: 'response_item',
+          payload: {
+            type: 'custom_tool_call',
+            name: 'apply_patch',
+            call_id: 'call_patch_raw',
+            input: '*** Begin Patch\n*** Update File: src/main.ts\n*** End Patch',
+          },
+        }),
+        JSON.stringify({ timestamp: testTime({ seconds: 1 }), type: 'response_item', payload: { type: 'custom_tool_call_output', call_id: 'call_patch_raw', output } }),
+      ].join('\n');
+
+      const messages = parseCodexSessionContent(content);
+      const assistantMsg = messages.find(m => m.role === 'assistant' && m.toolCalls);
+      const patchTool = assistantMsg!.toolCalls!.find(tc => tc.name === 'apply_patch');
+      expect(patchTool).toMatchObject({ status: output.startsWith('Error:') ? 'error' : 'completed', result: output });
+      expect(patchTool!.input.patch).toBe('*** Begin Patch\n*** Update File: src/main.ts\n*** End Patch');
+    });
+
+    it('restores update_plan as TodoWrite', async () => {
+      const filePath = path.join(FIXTURES_DIR, 'codex-session-persisted-tools.jsonl');
+      const messages = await parseCodexSessionFileAsync(filePath);
+
+      const assistantMsg = messages.find(m => m.role === 'assistant' && m.toolCalls);
+      const todoTool = assistantMsg!.toolCalls!.find(tc => tc.name === 'TodoWrite');
+      expect(todoTool).toBeDefined();
+      expect(todoTool!.id).toBe('call_plan_1');
+      expect(todoTool!.input.todos).toEqual([
+        expect.objectContaining({ content: 'Fix the bug', status: 'completed' }),
+        expect.objectContaining({ content: 'Run tests', status: 'in_progress' }),
+      ]);
+    });
+
+    it('restores request_user_input as AskUserQuestion', async () => {
+      const filePath = path.join(FIXTURES_DIR, 'codex-session-persisted-tools.jsonl');
+      const messages = await parseCodexSessionFileAsync(filePath);
+
+      const assistantMsg = messages.find(m => m.role === 'assistant' && m.toolCalls);
+      const askTool = assistantMsg!.toolCalls!.find(tc => tc.name === 'AskUserQuestion');
+      expect(askTool).toBeDefined();
+      expect(askTool!.id).toBe('call_ask_1');
+      expect(askTool!.input.questions).toEqual([
+        expect.objectContaining({ question: 'Should I also update the tests?', id: 'q1' }),
+      ]);
+    });
+
+    it('restores request_user_input options and multi-select metadata', () => {
+      const content = [
+        JSON.stringify({
+          timestamp: '2026-03-27T00:00:00.000Z',
+          type: 'response_item',
+          payload: {
+            type: 'function_call',
+            name: 'request_user_input',
+            call_id: 'call_ask_opts',
+            arguments: JSON.stringify({
+              questions: [{
+                id: 'title_generation_timing',
+                question: 'When should I generate the title?',
+                options: [
+                  { label: 'Non-blocking', description: 'Generate it later.' },
+                  { label: 'Blocking', description: 'Wait before continuing.' },
+                ],
+                multi_select: true,
+              }],
+            }),
+          },
+        }),
+      ].join('\n');
+
+      const messages = parseCodexSessionContent(content);
+      const assistantMsg = messages.find(m => m.role === 'assistant' && m.toolCalls);
+      const askTool = assistantMsg!.toolCalls!.find(tc => tc.name === 'AskUserQuestion');
+
+      expect(askTool!.input.questions).toEqual([
+        {
+          id: 'title_generation_timing',
+          question: 'When should I generate the title?',
+          header: 'Q1',
+          options: [
+            { label: 'Non-blocking', description: 'Generate it later.' },
+            { label: 'Blocking', description: 'Wait before continuing.' },
+          ],
+          multiSelect: true,
+        },
+      ]);
+    });
+
+    it('restores view_image as Read', async () => {
+      const filePath = path.join(FIXTURES_DIR, 'codex-session-persisted-tools.jsonl');
+      const messages = await parseCodexSessionFileAsync(filePath);
+
+      const assistantMsg = messages.find(m => m.role === 'assistant' && m.toolCalls);
+      const readTool = assistantMsg!.toolCalls!.find(tc => tc.name === 'Read');
+      expect(readTool).toBeDefined();
+      expect(readTool!.id).toBe('call_img_1');
+      expect(readTool!.input.file_path).toBe('/tmp/screenshot.png');
+    });
+
+    it('restores non-empty write_stdin as native write_stdin', async () => {
+      const filePath = path.join(FIXTURES_DIR, 'codex-session-persisted-tools.jsonl');
+      const messages = await parseCodexSessionFileAsync(filePath);
+
+      const assistantMsg = messages.find(m => m.role === 'assistant' && m.toolCalls);
+      const stdinTool = assistantMsg!.toolCalls!.find(tc => tc.name === 'write_stdin');
+      expect(stdinTool).toBeDefined();
+      expect(stdinTool!.id).toBe('call_stdin_1');
+      expect(stdinTool!.input.session_id).toBe('sess_1');
+      expect(stdinTool!.input.chars).toBe('y\n');
+    });
+
+    it.each(['Input sent.', '', 'Script completed\nWall time 0.1 seconds\nOutput:\nInput sent.'])('suppresses acknowledgement-only standalone polling output: %s', output => {
+      const records = [
+        { type: 'event_msg', payload: { type: 'task_started' } },
+        { type: 'response_item', payload: { type: 'function_call', name: 'view_image', call_id: 'image', arguments: '{"path":"/tmp/image.png"}' } },
+        { type: 'response_item', payload: { type: 'function_call', name: 'write_stdin', call_id: 'poll', arguments: '{"session_id":2404,"chars":""}' } },
+        { type: 'response_item', payload: { type: 'message', role: 'assistant', content: [{ type: 'output_text', text: 'Checking.' }] } },
+        { type: 'response_item', payload: { type: 'function_call_output', call_id: 'poll', output } },
+        { type: 'response_item', payload: { type: 'function_call_output', call_id: 'image', output: [{ type: 'input_image', image_url: 'data:image/png;base64,cGljdHVyZQ==' }] } },
+        { type: 'response_item', payload: { type: 'message', role: 'assistant', content: [{ type: 'output_text', text: 'Done.' }] } },
+      ];
+      const messages = parseCodexSessionContent(records.map((record, seconds) => JSON.stringify({
+        timestamp: testDate({ seconds }).toISOString(), ...record,
+      })).join('\n'));
+      expect(messages).toHaveLength(1);
+      expect(messages[0]).toMatchObject({ role: 'assistant', content: 'Checking.\n\nDone.', toolCalls: [
+        { id: 'image', name: 'Read', status: 'completed', result: '/tmp/image.png' },
+      ] });
+      expect(messages[0].contentBlocks).toEqual([
+        { type: 'tool_use', toolId: 'image' }, { type: 'text', content: 'Checking.\n\nDone.' },
+      ]);
+    });
+
+    it('maps long-running write_stdin polling output back to the parent Bash tool', () => {
+      const content = [
+        JSON.stringify({
+          timestamp: '2026-03-27T00:00:00.000Z',
+          type: 'response_item',
+          payload: {
+            type: 'message',
+            role: 'user',
+            content: [{ type: 'input_text', text: 'Run checks.' }],
+          },
+        }),
+        JSON.stringify({
+          timestamp: '2026-03-27T00:00:01.000Z',
+          type: 'response_item',
+          payload: {
+            type: 'function_call',
+            name: 'exec_command',
+            arguments: '{"cmd":"bun run check"}',
+            call_id: 'call_cmd',
+          },
+        }),
+        JSON.stringify({
+          timestamp: '2026-03-27T00:00:02.000Z',
+          type: 'response_item',
+          payload: {
+            type: 'function_call_output',
+            call_id: 'call_cmd',
+            output: 'Chunk ID: aaa\nWall time: 0.0000 seconds\nProcess running with session ID 2404\nOriginal token count: 3\nOutput:\n$ bun run check\n',
+          },
+        }),
+        JSON.stringify({
+          timestamp: '2026-03-27T00:00:03.000Z',
+          type: 'response_item',
+          payload: {
+            type: 'function_call',
+            name: 'write_stdin',
+            arguments: '{"session_id":2404,"chars":"","yield_time_ms":1000}',
+            call_id: 'call_poll',
+          },
+        }),
+        JSON.stringify({
+          timestamp: '2026-03-27T00:00:04.000Z',
+          type: 'response_item',
+          payload: {
+            type: 'function_call_output',
+            call_id: 'call_poll',
+            output: 'Chunk ID: bbb\nWall time: 1.0000 seconds\nProcess exited with code 0\nOriginal token count: 2\nOutput:\nall good\n',
+          },
+        }),
+        JSON.stringify({
+          timestamp: '2026-03-27T00:00:05.000Z',
+          type: 'response_item',
+          payload: {
+            type: 'message',
+            role: 'assistant',
+            content: [{ type: 'output_text', text: 'Done.' }],
+          },
+        }),
+      ].join('\n');
+
+      const messages = parseCodexSessionContent(content);
+      const assistantMsg = messages.find(m => m.role === 'assistant' && m.toolCalls);
+
+      expect(assistantMsg!.toolCalls!.map(tc => tc.name)).not.toContain('write_stdin');
+      const bashTool = assistantMsg!.toolCalls!.find(tc => tc.name === 'Bash');
+      expect(bashTool).toMatchObject({
+        id: 'call_cmd',
+        status: 'completed',
+        result: '$ bun run check\nall good\n',
+      });
+    });
+
+    it('keeps non-empty write_stdin separate from the parent Bash tool', () => {
+      const records = [
+        JSON.stringify({
+          timestamp: testTime({ seconds: 0 }),
+          type: 'response_item',
+          payload: {
+            type: 'message',
+            role: 'user',
+            content: [{ type: 'input_text', text: 'Confirm the prompt.' }],
+          },
+        }),
+        JSON.stringify({
+          timestamp: testTime({ seconds: 1 }),
+          type: 'response_item',
+          payload: {
+            type: 'function_call',
+            name: 'exec_command',
+            arguments: '{"cmd":"npm init"}',
+            call_id: 'call_cmd',
+          },
+        }),
+        JSON.stringify({
+          timestamp: testTime({ seconds: 2 }),
+          type: 'response_item',
+          payload: {
+            type: 'function_call_output',
+            call_id: 'call_cmd',
+            output: 'Chunk ID: aaa\nWall time: 0.0000 seconds\nProcess running with session ID 2404\nOriginal token count: 2\nOutput:\nProceed? [y/N]\n',
+          },
+        }),
+        JSON.stringify({
+          timestamp: testTime({ seconds: 3 }),
+          type: 'response_item',
+          payload: {
+            type: 'function_call',
+            name: 'write_stdin',
+            arguments: '{"session_id":2404,"chars":"y\\n"}',
+            call_id: 'call_stdin',
+          },
+        }),
+        JSON.stringify({
+          timestamp: testTime({ seconds: 4 }),
+          type: 'response_item',
+          payload: {
+            type: 'function_call_output',
+            call_id: 'call_stdin',
+            output: JSON.stringify({ output: 'Input sent.', session_id: 2404 }),
+          },
+        }),
+        JSON.stringify({ timestamp: testTime({ seconds: 5 }), type: 'response_item', payload: { type: 'function_call', name: 'write_stdin', call_id: 'poll-after-input', arguments: '{"session_id":2404,"chars":""}' } }),
+        JSON.stringify({ timestamp: testTime({ seconds: 6 }), type: 'response_item', payload: { type: 'function_call_output', call_id: 'poll-after-input', output: 'Process exited with code 0\nOutput:\nFinished' } }),
+      ];
+      const content = records.join('\n');
+
+      const beforePoll = parseCodexSessionContent(records.slice(0, 5).join('\n')).flatMap(message => message.toolCalls ?? []);
+      expect(beforePoll).toEqual([
+        expect.objectContaining({ id: 'call_cmd', status: 'running', result: 'Proceed? [y/N]\n' }),
+        expect.objectContaining({ id: 'call_stdin', status: 'completed', input: { session_id: 2404, chars: 'y\n' }, result: 'Input sent.' }),
+      ]);
+      const messages = parseCodexSessionContent(content);
+      const assistantMsg = messages.find(m => m.role === 'assistant' && m.toolCalls);
+      const bashTool = assistantMsg!.toolCalls!.find(tc => tc.name === 'Bash');
+      const stdinTool = assistantMsg!.toolCalls!.find(tc => tc.name === 'write_stdin');
+
+      expect(bashTool).toMatchObject({
+        id: 'call_cmd',
+        status: 'completed',
+        result: 'Proceed? [y/N]\nFinished',
+      });
+      expect(stdinTool).toMatchObject({
+        id: 'call_stdin',
+        status: 'completed',
+        input: { session_id: 2404, chars: 'y\n' },
+        result: 'Input sent.',
+      });
+    });
+
+    it('drops orphan custom_tool_call_output rows instead of rendering generic tool cards', () => {
+      const content = [
+        JSON.stringify({ timestamp: testTime(), type: 'response_item', payload: { type: 'function_call_output', output: 'Unowned output' } }),
+        JSON.stringify({
+          timestamp: testTime({ seconds: 0 }),
+          type: 'response_item',
+          payload: {
+            type: 'custom_tool_call_output',
+            call_id: 'call_patch_orphan',
+            output: 'Success. Updated the following files:\nM /tmp/a.ts\n',
+          },
+        }),
+        JSON.stringify({
+          timestamp: testTime({ seconds: 1 }),
+          type: 'response_item',
+          payload: {
+            type: 'message',
+            role: 'assistant',
+            content: [{ type: 'output_text', text: 'Done.' }],
+          },
+        }),
+      ].join('\n');
+
+      const messages = parseCodexSessionContent(content);
+
+      expect(messages).toHaveLength(1);
+      expect(messages[0].role).toBe('assistant');
+      expect(messages[0].toolCalls).toBeUndefined();
+      expect(messages[0].content).toBe('Done.');
+    });
+  });
+
+  describe('parseCodexSessionFileAsync - agent lifecycle', () => {
+    it('restores agent lifecycle tools with native names', async () => {
+      const filePath = path.join(FIXTURES_DIR, 'codex-session-agent-lifecycle.jsonl');
+      const messages = await parseCodexSessionFileAsync(filePath);
+
+      const assistantMsg = messages.find(m => m.role === 'assistant' && m.toolCalls);
+      expect(assistantMsg).toBeDefined();
+      const toolNames = assistantMsg!.toolCalls!.map(tc => tc.name);
+
+      expect(toolNames).toContain('spawn_agent');
+      expect(toolNames).toContain('send_input');
+      expect(toolNames).toContain('wait');
+      expect(toolNames).toContain('resume_agent');
+      expect(toolNames).toContain('close_agent');
+
+      // Should NOT be mapped to Agent/Task
+      expect(toolNames).not.toContain('Agent');
+      expect(toolNames).not.toContain('Task');
+    });
+
+    it('preserves spawn_agent input fields', async () => {
+      const filePath = path.join(FIXTURES_DIR, 'codex-session-agent-lifecycle.jsonl');
+      const messages = await parseCodexSessionFileAsync(filePath);
+
+      const assistantMsg = messages.find(m => m.role === 'assistant' && m.toolCalls);
+      const spawnTool = assistantMsg!.toolCalls!.find(tc => tc.name === 'spawn_agent');
+      expect(spawnTool!.input).toEqual({
+        message: 'Update the imports in utils.ts',
+        agent_type: 'code-writer',
+      });
+    });
+
+    it('preserves wait input fields', async () => {
+      const filePath = path.join(FIXTURES_DIR, 'codex-session-agent-lifecycle.jsonl');
+      const messages = await parseCodexSessionFileAsync(filePath);
+
+      const assistantMsg = messages.find(m => m.role === 'assistant' && m.toolCalls);
+      const waitTool = assistantMsg!.toolCalls!.find(tc => tc.name === 'wait');
+      expect(waitTool!.input).toEqual({
+        ids: ['agent_001'],
+        timeout_ms: 30000,
+      });
+    });
+  });
+
+  describe('parseCodexSessionContent - system-injected user messages', () => {
+    it('ignores injected user context without splitting an active assistant bubble', () => {
+      const records = [
+        { type: 'event_msg', payload: { type: 'task_started', turn_id: 'active' } },
+        { type: 'response_item', payload: { type: 'message', role: 'assistant', content: [{ type: 'output_text', text: 'Before' }] } },
+        { type: 'response_item', payload: { type: 'message', role: 'user', content: [{ type: 'input_text', text: '<environment_context>\n  <cwd>/vault</cwd>\n</environment_context>' }] } },
+        { type: 'response_item', payload: { type: 'message', role: 'assistant', content: [{ type: 'output_text', text: 'After' }] } },
+        { type: 'event_msg', payload: { type: 'task_complete', turn_id: 'active' } },
+      ];
+      const turns = parseCodexSessionTurns(records.map((record, seconds) => JSON.stringify({ timestamp: testTime({ seconds }), ...record })).join('\n'));
+      expect(turns).toEqual([{ turnId: 'active', messages: [expect.objectContaining({
+        role: 'assistant', content: 'Before\n\nAfter', assistantMessageId: 'active',
+        contentBlocks: [{ type: 'text', content: 'Before\n\nAfter' }],
+      })] }]);
+    });
+
+    it.each([
+      ['with a current input', 'Earlier answer', 'Next question', ['Next question', 'Next answer']],
+      ['without a current input', 'Earlier answer', null, ['Next answer']],
+      // Image markup inside replayed history must not be stripped before the envelope is measured.
+      ['replaying image markup', 'Use <image href="chart.png"></image>.', 'Next question', ['Next question', 'Next answer']],
+    ])('shows only the visible input of a history replay envelope %s', (_case, earlierAnswer, currentInput, expected) => {
+      const prompt = encodeRecoveryPrompt(`User: Earlier question\n\nAssistant: ${earlierAnswer}`, currentInput);
+      const content = [
+        { type: 'event_msg', payload: { type: 'task_started', turn_id: 'turn-replay' } },
+        { type: 'response_item', payload: { type: 'message', role: 'user', content: [{ type: 'input_text', text: prompt }] } },
+        { type: 'event_msg', payload: { type: 'user_message', message: prompt } },
+        { type: 'response_item', payload: { type: 'message', role: 'assistant', content: [{ type: 'output_text', text: 'Next answer' }] } },
+        { type: 'event_msg', payload: { type: 'task_complete', turn_id: 'turn-replay' } },
+      ].map((record, seconds) => JSON.stringify({ ...record, timestamp: testDate({ seconds }).toISOString() })).join('\n');
+
+      const messages = parseCodexSessionContent(content);
+
+      expect(messages.map(message => message.content)).toEqual(expected);
+      expect(JSON.stringify(messages)).not.toContain('Earlier question');
+    });
+
+    it('should skip AGENTS.md instructions injected as user message', () => {
+      const content = [
+        JSON.stringify({ type: 'session_meta', id: 'test-session' }),
+        JSON.stringify({
+          type: 'response_item',
+          payload: {
+            type: 'message',
+            role: 'developer',
+            content: [{ type: 'input_text', text: '<permissions instructions>\nSandbox mode...\n</permissions instructions>' }],
+          },
+        }),
+        JSON.stringify({
+          type: 'response_item',
+          payload: {
+            type: 'message',
+            role: 'user',
+            content: [
+              { type: 'input_text', text: '# AGENTS.md instructions for /Users/test/project\n\n<INSTRUCTIONS>\nDo good work.\n</INSTRUCTIONS>' },
+              { type: 'input_text', text: '<environment_context>\n  <cwd>/Users/test/project</cwd>\n</environment_context>' },
+            ],
+          },
+        }),
+        JSON.stringify({ type: 'event_msg', payload: { type: 'task_started' } }),
+        JSON.stringify({
+          timestamp: '2026-03-27T00:00:00.000Z',
+          type: 'response_item',
+          payload: {
+            type: 'message',
+            role: 'user',
+            content: [{ type: 'input_text', text: 'Fix the bug in main.ts' }],
+          },
+        }),
+        JSON.stringify({
+          timestamp: '2026-03-27T00:00:01.000Z',
+          type: 'response_item',
+          payload: {
+            type: 'message',
+            role: 'assistant',
+            content: [{ type: 'output_text', text: 'Done.' }],
+          },
+        }),
+      ].join('\n');
+
+      const messages = parseCodexSessionContent(content);
+
+      // AGENTS.md message should be filtered out; only real user + assistant remain
+      expect(messages).toHaveLength(2);
+      expect(messages[0]).toMatchObject({ role: 'user', content: 'Fix the bug in main.ts' });
+      expect(messages[1]).toMatchObject({ role: 'assistant', content: 'Done.' });
+    });
+
+    it('should skip standalone <environment_context> user message', () => {
+      const content = [
+        JSON.stringify({
+          type: 'response_item',
+          payload: {
+            type: 'message',
+            role: 'user',
+            content: [{ type: 'input_text', text: '<environment_context>\n  <cwd>/Users/test</cwd>\n</environment_context>' }],
+          },
+        }),
+        JSON.stringify({
+          timestamp: '2026-03-27T00:00:00.000Z',
+          type: 'response_item',
+          payload: {
+            type: 'message',
+            role: 'assistant',
+            content: [{ type: 'output_text', text: 'Ready.' }],
+          },
+        }),
+      ].join('\n');
+
+      const messages = parseCodexSessionContent(content);
+
+      expect(messages).toHaveLength(1);
+      expect(messages[0]).toMatchObject({ role: 'assistant', content: 'Ready.' });
+    });
+
+    it('should skip recommended plugin metadata before AGENTS.md instructions', () => {
+      const metadataText = [
+        '<recommended_plugins>',
+        'Install Google Drive when it would help.',
+        '</recommended_plugins>',
+        '# AGENTS.md instructions for /Users/test/project',
+        '',
+        '<INSTRUCTIONS>',
+        'Do good work.',
+        '</INSTRUCTIONS>',
+        '<environment_context>',
+        '  <cwd>/Users/test/project</cwd>',
+        '</environment_context>',
+      ].join('\n');
+      const content = [
+        JSON.stringify({
+          type: 'response_item',
+          payload: {
+            type: 'message',
+            role: 'user',
+            content: [{ type: 'input_text', text: metadataText }],
+          },
+        }),
+        JSON.stringify({
+          timestamp: '2026-07-10T00:00:00.000Z',
+          type: 'response_item',
+          payload: {
+            type: 'message',
+            role: 'assistant',
+            content: [{ type: 'output_text', text: 'Ready.' }],
+          },
+        }),
+      ].join('\n');
+
+      const messages = parseCodexSessionContent(content);
+
+      expect(messages).toHaveLength(1);
+      expect(messages[0]).toMatchObject({ role: 'assistant', content: 'Ready.' });
+    });
+
+    it('should skip Conductor interrupt control envelope persisted as user message', () => {
+      const conductorControlText = [
+        '<system_instruction>',
+        'You are working inside Conductor, a Mac app that lets the user run many coding agents in parallel.',
+        '</system_instruction>',
+        '',
+        '<turn_aborted>',
+        'The user interrupted the previous turn on purpose.',
+        '</turn_aborted>',
+        '',
+        '<user-preferences>',
+        'dev notes and throwaway scripts should be placed inside .context/',
+        '</user-preferences>',
+      ].join('\n');
+
+      const content = [
+        JSON.stringify({
+          type: 'response_item',
+          payload: {
+            type: 'message',
+            role: 'user',
+            content: [{ type: 'input_text', text: conductorControlText }],
+          },
+        }),
+        JSON.stringify({
+          timestamp: '2026-03-27T00:00:00.000Z',
+          type: 'response_item',
+          payload: {
+            type: 'message',
+            role: 'user',
+            content: [{ type: 'input_text', text: 'Fix the interrupt rendering bug.' }],
+          },
+        }),
+        JSON.stringify({
+          timestamp: '2026-03-27T00:00:01.000Z',
+          type: 'response_item',
+          payload: {
+            type: 'message',
+            role: 'assistant',
+            content: [{ type: 'output_text', text: 'Fixed.' }],
+          },
+        }),
+      ].join('\n');
+
+      const messages = parseCodexSessionContent(content);
+
+      expect(messages).toHaveLength(2);
+      expect(messages[0]).toMatchObject({ role: 'user', content: 'Fix the interrupt rendering bug.' });
+      expect(messages[1]).toMatchObject({ role: 'assistant', content: 'Fixed.' });
+    });
+
+    it('should strip leading Conductor control blocks and keep visible user text', () => {
+      const content = [
+        JSON.stringify({
+          timestamp: '2026-03-27T00:00:00.000Z',
+          type: 'response_item',
+          payload: {
+            type: 'message',
+            role: 'user',
+            content: [{
+              type: 'input_text',
+              text: [
+                '<system_instruction>',
+                'You are working inside Conductor.',
+                '</system_instruction>',
+                '',
+                '<turn_aborted>',
+                'The user interrupted the previous turn on purpose.',
+                '</turn_aborted>',
+                '',
+                'Hide the interrupt envelope, but keep this prompt.',
+              ].join('\n'),
+            }],
+          },
+        }),
+        JSON.stringify({
+          timestamp: '2026-03-27T00:00:01.000Z',
+          type: 'response_item',
+          payload: {
+            type: 'message',
+            role: 'assistant',
+            content: [{ type: 'output_text', text: 'Done.' }],
+          },
+        }),
+      ].join('\n');
+
+      const messages = parseCodexSessionContent(content);
+
+      expect(messages).toHaveLength(2);
+      expect(messages[0]).toMatchObject({
+        role: 'user',
+        content: 'Hide the interrupt envelope, but keep this prompt.',
+      });
+      expect(messages[1]).toMatchObject({ role: 'assistant', content: 'Done.' });
+    });
+
+    it('should set displayContent stripping bracket context from user messages', () => {
+      const content = [
+        JSON.stringify({
+          timestamp: '2026-03-27T00:00:00.000Z',
+          type: 'response_item',
+          payload: {
+            type: 'message',
+            role: 'user',
+            content: [{ type: 'input_text', text: 'Fix the bug\n[Current note: notes/bug.md]' }],
+          },
+        }),
+        JSON.stringify({
+          timestamp: '2026-03-27T00:00:01.000Z',
+          type: 'response_item',
+          payload: {
+            type: 'message',
+            role: 'assistant',
+            content: [{ type: 'output_text', text: 'Done.' }],
+          },
+        }),
+      ].join('\n');
+
+      const messages = parseCodexSessionContent(content);
+
+      expect(messages).toHaveLength(2);
+      expect(messages[0]).toMatchObject({
+        role: 'user',
+        content: 'Fix the bug\n[Current note: notes/bug.md]',
+        displayContent: 'Fix the bug',
+      });
+    });
+
+    it('should set displayContent stripping editor selection context', () => {
+      const content = [
+        JSON.stringify({
+          timestamp: '2026-03-27T00:00:00.000Z',
+          type: 'response_item',
+          payload: {
+            type: 'message',
+            role: 'user',
+            content: [{ type: 'input_text', text: 'Explain this\n[Editor selection from notes/code.md:\nconst x = 1;\n]' }],
+          },
+        }),
+        JSON.stringify({
+          timestamp: '2026-03-27T00:00:01.000Z',
+          type: 'response_item',
+          payload: {
+            type: 'message',
+            role: 'assistant',
+            content: [{ type: 'output_text', text: 'It declares a variable.' }],
+          },
+        }),
+      ].join('\n');
+
+      const messages = parseCodexSessionContent(content);
+
+      expect(messages[0]).toMatchObject({
+        role: 'user',
+        displayContent: 'Explain this',
+      });
+    });
+
+    it('should not set displayContent on plain user messages', () => {
+      const content = [
+        JSON.stringify({
+          timestamp: '2026-03-27T00:00:00.000Z',
+          type: 'response_item',
+          payload: {
+            type: 'message',
+            role: 'user',
+            content: [{ type: 'input_text', text: 'What does main.ts do?' }],
+          },
+        }),
+        JSON.stringify({
+          timestamp: '2026-03-27T00:00:01.000Z',
+          type: 'response_item',
+          payload: {
+            type: 'message',
+            role: 'assistant',
+            content: [{ type: 'output_text', text: 'It initializes the plugin.' }],
+          },
+        }),
+      ].join('\n');
+
+      const messages = parseCodexSessionContent(content);
+
+      expect(messages).toHaveLength(2);
+      expect(messages[0]).toMatchObject({ role: 'user', content: 'What does main.ts do?' });
+      expect(messages[0].displayContent).toBeUndefined();
+    });
+
+    it('should filter out skill wrapper user messages as system-injected', () => {
+      const skillText = [
+        '<skill>',
+        '<name>test</name>',
+        '<path>/Users/me/.codex/skills/test/SKILL.md</path>',
+        '---',
+        'description: testing',
+        '---',
+        '',
+        '## Task',
+        '',
+        'tell me a joke',
+        '',
+        '</skill>',
+      ].join('\n');
+
+      const content = [
+        JSON.stringify({
+          timestamp: '2026-03-27T00:00:00.000Z',
+          type: 'response_item',
+          payload: {
+            type: 'message',
+            role: 'user',
+            content: [{ type: 'input_text', text: skillText }],
+          },
+        }),
+        JSON.stringify({
+          timestamp: '2026-03-27T00:00:01.000Z',
+          type: 'response_item',
+          payload: {
+            type: 'message',
+            role: 'assistant',
+            content: [{ type: 'output_text', text: 'Why did the skeleton...' }],
+          },
+        }),
+      ].join('\n');
+
+      const messages = parseCodexSessionContent(content);
+
+      // Skill wrapper is system-injected — only the assistant message should remain
+      expect(messages).toHaveLength(1);
+      expect(messages[0]).toMatchObject({ role: 'assistant' });
+    });
+
+  });
+
+  describe('parseCodexSessionFileAsync - persisted web_search_call', () => {
+    it('restores web_search_call as WebSearch', async () => {
+      const filePath = path.join(FIXTURES_DIR, 'codex-session-websearch-persisted.jsonl');
+      const messages = await parseCodexSessionFileAsync(filePath);
+
+      const assistantMsg = messages.find(m => m.role === 'assistant' && m.toolCalls);
+      expect(assistantMsg).toBeDefined();
+
+      const searchTool = assistantMsg!.toolCalls!.find(tc => tc.name === 'WebSearch');
+      expect(searchTool).toBeDefined();
+      expect(searchTool!.id).toBe('tail-ws-1');
+      expect(searchTool!.input.actionType).toBe('search');
+      expect(searchTool!.input.query).toBe('obsidian plugin API');
+      expect(searchTool!.status).toBe('completed');
+    });
+
+    it('restores an in-progress native search before its result arrives', () => {
+      const records = [
+        { type: 'response_item', payload: { type: 'web_search_call', id: 'search', status: 'in_progress', action: { type: 'search', query: 'Obsidian' } } },
+      ];
+      expect(parseCodexSessionContent(records.map((record, seconds) => JSON.stringify({ timestamp: testTime({ seconds }), ...record })).join('\n')).flatMap(message => message.toolCalls ?? []))
+        .toEqual([expect.objectContaining({ id: 'tail-ws-0', name: 'WebSearch', status: 'running', input: expect.objectContaining({ query: 'Obsidian' }) })]);
+    });
+
+    it('keeps distinct persisted web_search_call entries', () => {
+      const content = [
+        JSON.stringify({
+          timestamp: '2026-03-27T00:00:00.000Z',
+          type: 'event_msg',
+          payload: { type: 'task_started' },
+        }),
+        JSON.stringify({
+          timestamp: '2026-03-27T00:00:01.000Z',
+          type: 'response_item',
+          payload: {
+            type: 'web_search_call',
+            status: 'completed',
+            action: { type: 'search', query: 'obsidian plugin API' },
+          },
+        }),
+        JSON.stringify({
+          timestamp: '2026-03-27T00:00:02.000Z',
+          type: 'response_item',
+          payload: {
+            type: 'web_search_call',
+            status: 'completed',
+            action: { type: 'open_page', url: 'https://docs.obsidian.md' },
+          },
+        }),
+      ].join('\n');
+
+      const messages = parseCodexSessionContent(content);
+      const assistantMsg = messages.find(m => m.role === 'assistant' && m.toolCalls);
+      expect(assistantMsg).toBeDefined();
+
+      const webSearchTools = assistantMsg!.toolCalls!.filter(tc => tc.name === 'WebSearch');
+      expect(webSearchTools).toHaveLength(2);
+      expect(webSearchTools[0]).toMatchObject({
+        id: 'tail-ws-1',
+        input: { actionType: 'search', query: 'obsidian plugin API' },
+        result: 'Search complete',
+      });
+      expect(webSearchTools[1]).toMatchObject({
+        id: 'tail-ws-2',
+        input: { actionType: 'open_page', url: 'https://docs.obsidian.md' },
+        result: 'Search complete',
+      });
+    });
+
+    it('attaches native exec search sources only to the open search with the same request', () => {
+      const call = (id: string, query = id) => ({ type: 'response_item', payload: { type: 'custom_tool_call', name: 'exec', call_id: id,
+        input: `text(await tools.web__run({search_query:[{q:"${query}"}]}));` } });
+      const output = (id: string) => ({ type: 'response_item', payload: { type: 'custom_tool_call_output', call_id: id, output: 'Search complete' } });
+      const native = (id: string) => ({ type: 'event_msg', payload: { type: 'item_completed', item: { type: 'Extension', kind: 'web.search',
+        id: `native-${id}`, query: id, results: [{ type: 'text_result', title: `${id} source`, url: `https://example.com/${id}` }] } } });
+      const records = [
+        // Concurrent scripts: the native request identifies its search.
+        call('a'), call('b'), native('b'), output('b'), output('a'),
+        // Sequential script, followed by a duplicate native event that must not claim the next search.
+        call('c'), native('c'), output('c'), call('d'), native('c'), output('d'),
+        // A repeated event after its own script closes.
+        call('e'), call('f'), native('f'), output('f'), native('f'), output('e'),
+        // A repeated event must not claim a later search for the same query.
+        call('g'), native('g'), output('g'), call('h', 'g'), native('g'), output('h'),
+        call('i', 'b'), { ...native('b'), payload: { ...native('b').payload, item: { ...native('b').payload.item, id: 'native-i' } } }, output('i'),
+        native('no-script'),
+      ];
+      const tools = parseCodexSessionContent(records.map((record, seconds) => JSON.stringify({ timestamp: testTime({ seconds }), ...record })).join('\n'))
+        .flatMap(message => message.toolCalls ?? []);
+
+      expect(Object.fromEntries(tools.map(tool => [tool.id, tool.webSearchResults?.map(result => result.title)]))).toEqual({
+        a: undefined, b: ['b source'], c: ['c source'], d: undefined, e: undefined, f: ['f source'], g: ['g source'], h: undefined, i: ['b source'],
+      });
+    });
+  });
+
+  describe('parseCodexSessionContent - native exec item timing', () => {
+    it.each(['before script output', 'after script output', 'after the script yields'])('attaches native search sources arriving %s', timing => {
+      const raw = (payload: Record<string, unknown>) => ({ type: 'response_item', payload });
+      const call = raw({ type: 'custom_tool_call', name: 'exec', call_id: 'search', input: 'text(await tools.web__run({search_query:[{q:"HBM supply"}]}));' });
+      const completed = (callId: string) => raw({ type: 'custom_tool_call_output', call_id: callId, output: 'Script completed\nWall time 0.1 seconds\nOutput:\nSource (https://example.com/source)' });
+      const native = { type: 'event_msg', payload: { type: 'item_completed', item: {
+        type: 'Extension', kind: 'web.search', id: 'native-search', query: 'HBM supply',
+        results: [{ type: 'text_result', title: 'Source', url: 'https://example.com/source' }],
+      } } };
+      const records = timing === 'before script output' ? [call, native, completed('search')]
+        : timing === 'after script output' ? [call, completed('search'), native]
+          : [call, raw({ type: 'custom_tool_call_output', call_id: 'search', output: 'Script running with cell ID 42\nWall time 0.1 seconds\nOutput:\n' }),
+              native, raw({ type: 'function_call', name: 'wait', call_id: 'wait', arguments: '{"cell_id":"42"}' }),
+              { ...completed('wait'), payload: { ...completed('wait').payload, type: 'function_call_output' } }];
+      const tools = parseCodexSessionContent(records.map((record, seconds) => JSON.stringify({ timestamp: testTime({ seconds }), ...record })).join('\n'))
+        .flatMap(message => message.toolCalls ?? []);
+
+      expect(tools.find(tool => tool.name === 'WebSearch')?.webSearchResults).toEqual([{ title: 'Source', url: 'https://example.com/source' }]);
+    });
+  });
+
+  describe('parseCodexSessionContent - event_msg handling', () => {
+    it('task_started + agent_message + task_complete produces proper turn', () => {
+      const content = [
+        JSON.stringify({
+          timestamp: '2026-03-27T00:00:00.000Z',
+          type: 'response_item',
+          payload: {
+            type: 'message',
+            role: 'user',
+            content: [{ type: 'input_text', text: 'Hello' }],
+          },
+        }),
+        JSON.stringify({
+          timestamp: '2026-03-27T00:00:01.000Z',
+          type: 'event_msg',
+          payload: { type: 'task_started' },
+        }),
+        JSON.stringify({
+          timestamp: '2026-03-27T00:00:02.000Z',
+          type: 'event_msg',
+          payload: { type: 'agent_message', message: 'Hi there!' },
+        }),
+        JSON.stringify({
+          timestamp: '2026-03-27T00:00:03.000Z',
+          type: 'event_msg',
+          payload: { type: 'task_complete' },
+        }),
+      ].join('\n');
+
+      const messages = parseCodexSessionContent(content);
+
+      expect(messages).toHaveLength(2);
+      expect(messages[0]).toMatchObject({ role: 'user', content: 'Hello' });
+      expect(messages[1]).toMatchObject({ role: 'assistant', content: 'Hi there!' });
+    });
+
+    it('turn_aborted marks the last bubble as interrupted and clears duration across the turn', () => {
+      const records = [
+        { type: 'event_msg', payload: { type: 'task_started', turn_id: 'interrupted-turn' } },
+        { type: 'event_msg', payload: { type: 'user_message', message: 'Investigate the build.' } },
+        { type: 'event_msg', payload: { type: 'agent_message', message: 'Reading the build notes.' } },
+        { type: 'event_msg', payload: { type: 'context_compacted' } },
+        { type: 'event_msg', payload: { type: 'agent_message', message: 'Checking the build command.' } },
+        { type: 'event_msg', payload: { type: 'turn_aborted' } },
+      ].map((record, seconds) => JSON.stringify({ timestamp: testDate({ seconds }).toISOString(), ...record }));
+      const beforeInterrupt = parseCodexSessionContent(records.slice(0, -1).join('\n'));
+      expect(beforeInterrupt.at(-1)?.durationSeconds).toBeGreaterThan(0);
+
+      const messages = parseCodexSessionContent(records.join('\n'));
+      const assistants = messages.filter(message => message.role === 'assistant');
+      expect(assistants).toHaveLength(3);
+      expect(assistants[0]).toMatchObject({ content: 'Reading the build notes.' });
+      expect(assistants[1].contentBlocks).toEqual([{ type: 'context_compacted' }]);
+      expect(assistants[2]).toMatchObject({ content: 'Checking the build command.', isInterrupt: true });
+      expect(assistants[0].isInterrupt).not.toBe(true);
+      for (const message of assistants) {
+        expect(message.durationSeconds).toBeUndefined();
+        expect(message.completedAt).toBeUndefined();
+        expect(message.turnStats).toBeUndefined();
+        expect(message.assistantMessageId).toBeUndefined();
+      }
+    });
+
+    it('user_message reconstructs user ChatMessage from event_msg', () => {
+      const content = [
+        JSON.stringify({
+          timestamp: '2026-03-27T00:00:00.000Z',
+          type: 'event_msg',
+          payload: { type: 'task_started' },
+        }),
+        JSON.stringify({
+          timestamp: '2026-03-27T00:00:00.500Z',
+          type: 'event_msg',
+          payload: { type: 'user_message', message: 'What is 2+2?' },
+        }),
+        JSON.stringify({
+          timestamp: '2026-03-27T00:00:01.000Z',
+          type: 'event_msg',
+          payload: { type: 'agent_message', message: 'The answer is 4.' },
+        }),
+        JSON.stringify({
+          timestamp: '2026-03-27T00:00:02.000Z',
+          type: 'event_msg',
+          payload: { type: 'task_complete' },
+        }),
+      ].join('\n');
+
+      const messages = parseCodexSessionContent(content);
+
+      expect(messages).toHaveLength(2);
+      expect(messages[0]).toMatchObject({
+        role: 'user',
+        content: 'What is 2+2?',
+      });
+      expect(messages[1]).toMatchObject({
+        role: 'assistant',
+        content: 'The answer is 4.',
+      });
+    });
+
+    it('user_message with system content is filtered out', () => {
+      const content = [
+        JSON.stringify({
+          timestamp: '2026-03-27T00:00:00.000Z',
+          type: 'event_msg',
+          payload: { type: 'task_started' },
+        }),
+        JSON.stringify({
+          timestamp: '2026-03-27T00:00:00.500Z',
+          type: 'event_msg',
+          payload: { type: 'user_message', message: '# AGENTS.md instructions for /test\nDo good.' },
+        }),
+        JSON.stringify({
+          timestamp: '2026-03-27T00:00:01.000Z',
+          type: 'event_msg',
+          payload: { type: 'agent_message', message: 'Done.' },
+        }),
+        JSON.stringify({
+          timestamp: '2026-03-27T00:00:02.000Z',
+          type: 'event_msg',
+          payload: { type: 'task_complete' },
+        }),
+      ].join('\n');
+
+      const messages = parseCodexSessionContent(content);
+
+      // System user message should be filtered; only assistant remains
+      const userMessages = messages.filter(m => m.role === 'user');
+      expect(userMessages).toHaveLength(0);
+      expect(messages).toHaveLength(1);
+      expect(messages[0]).toMatchObject({ role: 'assistant', content: 'Done.' });
+    });
+  });
+
+  describe('parseCodexSessionContent - multi-bubble turns', () => {
+    it('assistant text + tool call + tool result + more text in single turn', () => {
+      const content = [
+        JSON.stringify({
+          timestamp: '2026-03-27T00:00:00.000Z',
+          type: 'response_item',
+          payload: {
+            type: 'message',
+            role: 'user',
+            content: [{ type: 'input_text', text: 'Check the file.' }],
+          },
+        }),
+        JSON.stringify({
+          timestamp: '2026-03-27T00:00:01.000Z',
+          type: 'event_msg',
+          payload: { type: 'agent_reasoning', text: 'Let me check.' },
+        }),
+        JSON.stringify({
+          timestamp: '2026-03-27T00:00:02.000Z',
+          type: 'response_item',
+          payload: {
+            type: 'function_call',
+            name: 'exec_command',
+            arguments: '{"command":"cat file.txt"}',
+            call_id: 'call_100',
+          },
+        }),
+        JSON.stringify({
+          timestamp: '2026-03-27T00:00:03.000Z',
+          type: 'response_item',
+          payload: {
+            type: 'function_call_output',
+            call_id: 'call_100',
+            output: 'Exit code: 0\nOutput:\nhello world',
+          },
+        }),
+        JSON.stringify({
+          timestamp: '2026-03-27T00:00:04.000Z',
+          type: 'response_item',
+          payload: {
+            type: 'message',
+            role: 'assistant',
+            content: [{ type: 'output_text', text: 'The file contains hello world.' }],
+          },
+        }),
+      ].join('\n');
+
+      const messages = parseCodexSessionContent(content);
+
+      expect(messages).toHaveLength(2);
+      expect(messages[0]).toMatchObject({ role: 'user', content: 'Check the file.' });
+
+      const assistant = messages[1];
+      expect(assistant.role).toBe('assistant');
+      expect(assistant.content).toBe('The file contains hello world.');
+
+      // Tool calls should be present
+      expect(assistant.toolCalls).toHaveLength(1);
+      expect(assistant.toolCalls![0]).toMatchObject({
+        id: 'call_100',
+        name: 'Bash',
+        status: 'completed',
+      });
+
+      // Content blocks: thinking, tool_use, text
+      expect(assistant.contentBlocks).toBeDefined();
+      const blockTypes = assistant.contentBlocks!.map(b => b.type);
+      expect(blockTypes).toContain('thinking');
+      expect(blockTypes).toContain('tool_use');
+      expect(blockTypes).toContain('text');
+    });
+  });
+
+  describe('parseCodexSessionContent - cross-turn tool output', () => {
+    it('function_call in turn 1, function_call_output in turn 2 links back', () => {
+      const content = [
+        // Turn 1: user + tool call
+        JSON.stringify({
+          timestamp: '2026-03-27T00:00:00.000Z',
+          type: 'response_item',
+          payload: {
+            type: 'message',
+            role: 'user',
+            content: [{ type: 'input_text', text: 'Run the command.' }],
+          },
+        }),
+        JSON.stringify({
+          timestamp: '2026-03-27T00:00:01.000Z',
+          type: 'response_item',
+          payload: {
+            type: 'function_call',
+            name: 'exec_command',
+            arguments: '{"command":"echo hi"}',
+            call_id: 'call_cross_1',
+          },
+        }),
+        // Turn 2: new user message + output for turn 1's call
+        JSON.stringify({
+          timestamp: '2026-03-27T00:00:02.000Z',
+          type: 'response_item',
+          payload: {
+            type: 'message',
+            role: 'user',
+            content: [{ type: 'input_text', text: 'Continue.' }],
+          },
+        }),
+        JSON.stringify({
+          timestamp: '2026-03-27T00:00:03.000Z',
+          type: 'response_item',
+          payload: {
+            type: 'function_call_output',
+            call_id: 'call_cross_1',
+            output: 'Exit code: 0\nOutput:\nhi',
+          },
+        }),
+        JSON.stringify({
+          timestamp: '2026-03-27T00:00:04.000Z',
+          type: 'response_item',
+          payload: {
+            type: 'message',
+            role: 'assistant',
+            content: [{ type: 'output_text', text: 'Done.' }],
+          },
+        }),
+      ].join('\n');
+
+      const messages = parseCodexSessionContent(content);
+
+      // Find the assistant message from turn 1 (has the tool call)
+      const turn1Assistant = messages.find(
+        m => m.role === 'assistant' && m.toolCalls?.some(tc => tc.id === 'call_cross_1'),
+      );
+      expect(turn1Assistant).toBeDefined();
+
+      // The tool output should be resolved back to turn 1
+      const tc = turn1Assistant!.toolCalls!.find(t => t.id === 'call_cross_1');
+      expect(tc!.status).toBe('completed');
+      expect(tc!.result).toBe('hi');
+    });
+  });
+
+  describe('parseCodexSessionContent - non-string tool output', () => {
+    it('does not crash when function_call_output has an array output (e.g. view_image)', () => {
+      const content = [
+        JSON.stringify({
+          timestamp: '2026-03-27T00:00:00.000Z',
+          type: 'event_msg',
+          payload: { type: 'task_started', turn_id: 'turn-img' },
+        }),
+        JSON.stringify({
+          timestamp: '2026-03-27T00:00:01.000Z',
+          type: 'response_item',
+          payload: {
+            type: 'message',
+            role: 'user',
+            content: [{ type: 'input_text', text: 'Show me the image.' }],
+          },
+        }),
+        JSON.stringify({
+          timestamp: '2026-03-27T00:00:02.000Z',
+          type: 'response_item',
+          payload: {
+            type: 'function_call',
+            name: 'view_image',
+            arguments: '{"path":"/tmp/cat.png"}',
+            call_id: 'call_img_1',
+          },
+        }),
+        JSON.stringify({
+          timestamp: '2026-03-27T00:00:03.000Z',
+          type: 'response_item',
+          payload: {
+            type: 'function_call_output',
+            call_id: 'call_img_1',
+            output: [{ type: 'input_image', image_url: 'data:image/jpeg;base64,abc' }],
+          },
+        }),
+        JSON.stringify({
+          timestamp: '2026-03-27T00:00:04.000Z',
+          type: 'response_item',
+          payload: {
+            type: 'message',
+            role: 'assistant',
+            content: [{ type: 'output_text', text: 'Here is the image.' }],
+          },
+        }),
+        JSON.stringify({
+          timestamp: '2026-03-27T00:00:05.000Z',
+          type: 'event_msg',
+          payload: { type: 'task_complete' },
+        }),
+      ].join('\n');
+
+      const messages = parseCodexSessionContent(content);
+
+      // Should not throw and should produce messages
+      expect(messages.length).toBeGreaterThan(0);
+
+      // The tool call should be resolved
+      const assistantMsg = messages.find(
+        m => m.role === 'assistant' && m.toolCalls?.some(tc => tc.id === 'call_img_1'),
+      );
+      expect(assistantMsg).toBeDefined();
+
+      const tc = assistantMsg!.toolCalls!.find(t => t.id === 'call_img_1');
+      expect(tc!.status).toBe('completed');
+      expect(tc!.result).toBe('/tmp/cat.png');
+    });
+  });
+
+  describe('parseCodexSessionContent - interrupted message granularity', () => {
+
+    it.each(['turn_aborted', 'task_complete', 'unfinished'])('preserves an empty turn ending in %s without phantom content', ending => {
+      const records = [
+        { type: 'event_msg', payload: { type: 'task_started', turn_id: 'empty-turn' } },
+        { type: 'response_item', payload: { type: 'reasoning', summary: [], content: [], text: '  ' } },
+        { type: 'response_item', payload: { type: 'message', role: 'assistant', content: [] } },
+        ...(ending === 'unfinished' ? [] : [{ type: 'event_msg', payload: { type: ending } }]),
+      ];
+      const messages = parseCodexSessionContent(records.map((record, seconds) => JSON.stringify({
+        timestamp: testDate({ seconds }).toISOString(), ...record,
+      })).join('\n'));
+      expect(messages.map(({ role, content, isInterrupt, timestamp, contentBlocks, completedAt }) => ({
+        role, content, isInterrupt, timestamp, contentBlocks, completedAt,
+      }))).toEqual(ending === 'turn_aborted' ? [{
+        role: 'assistant', content: '', isInterrupt: true, timestamp: testDate({ seconds: 2 }).getTime(),
+        contentBlocks: undefined, completedAt: undefined,
+      }] : []);
+    });
+  });
+
+  describe('parseCodexSessionContent - response duration', () => {
+    it.each([0, -1])('does not report a response duration when assistant time is %s seconds after the user', offset => {
+      const records = [
+        { type: 'event_msg', timestamp: testTime({ seconds: -2 }), payload: { type: 'task_started' } },
+        { type: 'event_msg', timestamp: testTime(), payload: { type: 'user_message', message: 'Question' } },
+        { type: 'response_item', timestamp: testTime({ seconds: offset }), payload: { type: 'message', role: 'assistant', content: [{ type: 'output_text', text: 'Answer' }] } },
+        { type: 'event_msg', timestamp: testTime({ seconds: 2 }), payload: { type: 'task_complete' } },
+      ];
+      const messages = parseCodexSessionContent(records.map(record => JSON.stringify(record)).join('\n'));
+      expect(messages.map(message => message.content)).toEqual(['Question', 'Answer']);
+      expect(messages[1].durationSeconds).toBeUndefined();
+    });
+
+    it('calculates durationSeconds from user timestamp to last assistant event', () => {
+      const content = [
+        JSON.stringify({
+          timestamp: '2026-03-27T00:00:00.000Z',
+          type: 'response_item',
+          payload: {
+            type: 'message',
+            role: 'user',
+            content: [{ type: 'input_text', text: 'Quick question.' }],
+          },
+        }),
+        JSON.stringify({
+          timestamp: '2026-03-27T00:00:05.000Z',
+          type: 'response_item',
+          payload: {
+            type: 'message',
+            role: 'assistant',
+            content: [{ type: 'output_text', text: 'Quick answer.' }],
+          },
+        }),
+      ].join('\n');
+
+      const messages = parseCodexSessionContent(content);
+
+      expect(messages).toHaveLength(2);
+      const assistant = messages.find(m => m.role === 'assistant');
+      expect(assistant!.durationSeconds).toBe(5);
+    });
+
+    it('attaches durationSeconds to the last assistant message of the turn', () => {
+      const content = [
+        JSON.stringify({
+          timestamp: '2026-03-27T00:00:00.000Z',
+          type: 'response_item',
+          payload: {
+            type: 'message',
+            role: 'user',
+            content: [{ type: 'input_text', text: 'Do stuff.' }],
+          },
+        }),
+        JSON.stringify({
+          timestamp: '2026-03-27T00:00:02.000Z',
+          type: 'response_item',
+          payload: {
+            type: 'function_call',
+            name: 'exec_command',
+            arguments: '{"command":"ls"}',
+            call_id: 'call_dur_1',
+          },
+        }),
+        JSON.stringify({
+          timestamp: '2026-03-27T00:00:04.000Z',
+          type: 'response_item',
+          payload: {
+            type: 'function_call_output',
+            call_id: 'call_dur_1',
+            output: 'Exit code: 0\nOutput:\nfile.txt',
+          },
+        }),
+        JSON.stringify({
+          timestamp: '2026-03-27T00:00:10.000Z',
+          type: 'response_item',
+          payload: {
+            type: 'message',
+            role: 'assistant',
+            content: [{ type: 'output_text', text: 'Listed files.' }],
+          },
+        }),
+      ].join('\n');
+
+      const messages = parseCodexSessionContent(content);
+
+      const assistant = messages.find(m => m.role === 'assistant');
+      expect(assistant).toBeDefined();
+      expect(assistant!.durationSeconds).toBe(10);
+    });
+  });
+
+  describe('parseCodexSessionContent - server turn-ID exposure', () => {
+
+    it('sets user and assistant checkpoint IDs on a completed modern turn', () => {
+      const content = [
+        JSON.stringify({
+          timestamp: '2026-03-27T00:00:00.000Z',
+          type: 'event_msg',
+          payload: { type: 'task_started', turn_id: '019d-uuid-turn-1' },
+        }),
+        JSON.stringify({
+          timestamp: '2026-03-27T00:00:00.500Z',
+          type: 'response_item',
+          payload: {
+            type: 'message',
+            role: 'user',
+            content: [{ type: 'input_text', text: 'Hello' }],
+          },
+        }),
+        JSON.stringify({
+          timestamp: '2026-03-27T00:00:01.000Z',
+          type: 'response_item',
+          payload: {
+            type: 'message',
+            role: 'assistant',
+            content: [{ type: 'output_text', text: 'Hi there!' }],
+          },
+        }),
+        JSON.stringify({
+          timestamp: '2026-03-27T00:00:02.000Z',
+          type: 'event_msg',
+          payload: { type: 'task_complete', turn_id: '019d-uuid-turn-1' },
+        }),
+      ].join('\n');
+
+      const messages = parseCodexSessionContent(content);
+
+      expect(messages).toHaveLength(2);
+      expect(messages[0].role).toBe('user');
+      expect(messages[0].userMessageId).toBe('019d-uuid-turn-1');
+      expect(messages[1].role).toBe('assistant');
+      expect(messages[1].assistantMessageId).toBe('019d-uuid-turn-1');
+      expect(messages[1].completedAt).toBe(Date.parse('2026-03-27T00:00:02.000Z'));
+    });
+
+    it('does NOT set assistantMessageId on interrupted assistant bubbles', () => {
+      const content = [
+        JSON.stringify({
+          timestamp: '2026-03-27T00:00:00.000Z',
+          type: 'event_msg',
+          payload: { type: 'task_started', turn_id: '019d-uuid-aborted' },
+        }),
+        JSON.stringify({
+          timestamp: '2026-03-27T00:00:01.000Z',
+          type: 'event_msg',
+          payload: { type: 'agent_message', message: 'Starting...' },
+        }),
+        JSON.stringify({
+          timestamp: '2026-03-27T00:00:02.000Z',
+          type: 'event_msg',
+          payload: { type: 'turn_aborted' },
+        }),
+      ].join('\n');
+
+      const messages = parseCodexSessionContent(content);
+
+      expect(messages).toHaveLength(1);
+      expect(messages[0].isInterrupt).toBe(true);
+      expect(messages[0].assistantMessageId).toBeUndefined();
+    });
+
+    it('sets assistantMessageId on the last non-interrupt bubble in a multi-bubble turn', () => {
+      const content = [
+        JSON.stringify({
+          timestamp: '2026-03-27T00:00:00.000Z',
+          type: 'event_msg',
+          payload: { type: 'task_started', turn_id: '019d-uuid-multi' },
+        }),
+        JSON.stringify({
+          timestamp: '2026-03-27T00:00:00.500Z',
+          type: 'response_item',
+          payload: {
+            type: 'message',
+            role: 'user',
+            content: [{ type: 'input_text', text: 'Check files.' }],
+          },
+        }),
+        JSON.stringify({
+          timestamp: '2026-03-27T00:00:01.000Z',
+          type: 'response_item',
+          payload: {
+            type: 'function_call',
+            name: 'exec_command',
+            arguments: '{"command":"ls"}',
+            call_id: 'call_multi_1',
+          },
+        }),
+        JSON.stringify({
+          timestamp: '2026-03-27T00:00:02.000Z',
+          type: 'response_item',
+          payload: {
+            type: 'function_call_output',
+            call_id: 'call_multi_1',
+            output: 'Exit code: 0\nOutput:\nfile.txt',
+          },
+        }),
+        JSON.stringify({
+          timestamp: '2026-03-27T00:00:03.000Z',
+          type: 'response_item',
+          payload: {
+            type: 'message',
+            role: 'assistant',
+            content: [{ type: 'output_text', text: 'Found files.' }],
+          },
+        }),
+        JSON.stringify({
+          timestamp: '2026-03-27T00:00:04.000Z',
+          type: 'event_msg',
+          payload: { type: 'task_complete', turn_id: '019d-uuid-multi' },
+        }),
+      ].join('\n');
+
+      const messages = parseCodexSessionContent(content);
+
+      // user + assistant (single bubble with tool call and text)
+      const userMsg = messages.find(m => m.role === 'user');
+      expect(userMsg!.userMessageId).toBe('019d-uuid-multi');
+
+      // The last assistant message in the turn should get the checkpoint
+      const assistantMsgs = messages.filter(m => m.role === 'assistant');
+      const lastAssistant = assistantMsgs[assistantMsgs.length - 1];
+      expect(lastAssistant.assistantMessageId).toBe('019d-uuid-multi');
+    });
+
+    it.each([false, true])('retains history without a server turn ID when later turns have IDs (legacy start: %s)', legacyStart => {
+      const records = [
+        ...(legacyStart ? [{ type: 'event_msg', payload: { type: 'task_started' } }] : []),
+        { type: 'response_item', payload: { type: 'message', role: 'user', content: [{ type: 'input_text', text: 'Hello' }] } },
+        { type: 'response_item', payload: { type: 'message', role: 'assistant', content: [{ type: 'output_text', text: 'Hi!' }] } },
+        { type: 'event_msg', payload: { type: 'task_complete' } },
+        { type: 'event_msg', payload: { type: 'task_started', turn_id: 'later-turn' } },
+        { type: 'response_item', payload: { type: 'message', role: 'user', content: [{ type: 'input_text', text: 'Continue' }] } },
+        { type: 'response_item', payload: { type: 'message', role: 'assistant', content: [{ type: 'output_text', text: 'Ready.' }] } },
+        { type: 'event_msg', payload: { type: 'task_complete', turn_id: 'later-turn' } },
+      ];
+      const messages = parseCodexSessionContent(records.map((record, seconds) => JSON.stringify({ timestamp: testTime({ seconds }), ...record })).join('\n'));
+      expect(messages.map(message => message.content)).toEqual(['Hello', 'Hi!', 'Continue', 'Ready.']);
+      expect(messages[0].userMessageId).toBeUndefined();
+      expect(messages[1].assistantMessageId).toBeUndefined();
+      expect(messages[2].userMessageId).toBe('later-turn');
+      expect(messages[3].assistantMessageId).toBe('later-turn');
+    });
+  });
+
+  describe('parseCodexSessionTurns - turn-aware parsing', () => {
+    it('returns structured turns with stable unique message IDs and bubble grouping', () => {
+      const records = [
+        { type: 'event_msg', payload: { type: 'task_started', turn_id: 'uuid-turn-1' } },
+        { type: 'event_msg', payload: { type: 'user_message', message: 'First question' } },
+        { type: 'response_item', payload: { type: 'message', role: 'assistant', content: [{ type: 'output_text', text: 'First answer' }] } },
+        { type: 'event_msg', payload: { type: 'context_compacted' } },
+        { type: 'event_msg', payload: { type: 'agent_message', message: 'More details' } },
+        { type: 'event_msg', payload: { type: 'task_complete', turn_id: 'uuid-turn-1' } },
+        { type: 'event_msg', payload: { type: 'task_started', turn_id: 'uuid-turn-2' } },
+        { type: 'event_msg', payload: { type: 'user_message', message: 'Second question' } },
+        { type: 'event_msg', payload: { type: 'turn_aborted' } },
+        { type: 'event_msg', payload: { type: 'task_started', turn_id: 'uuid-turn-3' } },
+        { type: 'event_msg', payload: { type: 'user_message', message: 'Follow-up question' } },
+        { type: 'response_item', payload: { type: 'message', role: 'assistant', content: [{ type: 'output_text', text: 'Follow-up answer' }] } },
+        { type: 'event_msg', payload: { type: 'task_complete', turn_id: 'uuid-turn-3' } },
+      ];
+      const content = records.map((record, seconds) => JSON.stringify({
+        timestamp: testDate({ seconds }).toISOString(), ...record,
+      })).join('\n');
+      const turns = parseCodexSessionTurns(content);
+      expect(turns.map(turn => turn.turnId)).toEqual(['uuid-turn-1', 'uuid-turn-2', 'uuid-turn-3']);
+      expect(turns.map(turn => turn.messages.map(message => [message.role, message.content]))).toEqual([
+        [['user', 'First question'], ['assistant', 'First answer'], ['assistant', ''], ['assistant', 'More details']],
+        [['user', 'Second question'], ['assistant', '']],
+        [['user', 'Follow-up question'], ['assistant', 'Follow-up answer']],
+      ]);
+      expect(turns[1].messages[1].isInterrupt).toBe(true);
+      expect(turns.map(turn => turn.messages.map(message => message.timestamp))).toEqual([
+        [testDate({ seconds: 1 }).getTime(), testDate({ seconds: 2 }).getTime(), testDate({ seconds: 3 }).getTime(), testDate({ seconds: 4 }).getTime()],
+        [testDate({ seconds: 7 }).getTime(), testDate({ seconds: 8 }).getTime()],
+        [testDate({ seconds: 10 }).getTime(), testDate({ seconds: 11 }).getTime()],
+      ]);
+      expect(turns[0].messages.map(message => message.completedAt)).toEqual([undefined, undefined, undefined, testDate({ seconds: 5 }).getTime()]);
+      expect(parseCodexSessionTurns(content, 'uuid-turn-1')).toEqual(turns.slice(0, 1));
+      expect(parseCodexSessionTurns(content, 'uuid-turn-2')).toEqual(turns.slice(0, 2));
+      expect(parseCodexSessionTurns(content, 'uuid-turn-3')).toEqual(turns);
+      expect(parseCodexSessionTurns(content, 'unavailable-checkpoint')).toEqual(turns);
+
+      const ids = turns.flatMap(turn => turn.messages.map(message => message.id));
+      expect(ids.every(id => id.length > 0)).toBe(true);
+      expect(new Set(ids).size).toBe(ids.length);
+      expect(parseCodexSessionTurns(content).flatMap(turn => turn.messages.map(message => message.id))).toEqual(ids);
+      const bubbleGroups = turns.map(turn => {
+        const assistants = turn.messages.filter(message => message.role === 'assistant');
+        const group = assistants[0].turnId;
+        expect(group).toBeTruthy();
+        expect(assistants.every(message => message.turnId === group)).toBe(true);
+        return group;
+      });
+      expect(new Set(bubbleGroups).size).toBe(turns.length);
+    });
+
+    it('ignores retired records without losing modern messages in a mixed transcript', () => {
+      const content = [
+        { type: 'event_msg', payload: { type: 'task_started', turn_id: 'turn-modern' } },
+        { type: 'event', event: { type: 'item.completed', item: { id: 'retired', type: 'agent_message', text: 'Retired' } } },
+        { type: 'response_item', payload: { type: 'message', role: 'assistant', content: [{ type: 'output_text', text: 'Current' }] } },
+        { type: 'event_msg', payload: { type: 'task_complete', turn_id: 'turn-modern' } },
+      ].map(record => JSON.stringify(record)).join('\n');
+      const turns = parseCodexSessionTurns(content);
+      expect(turns).toHaveLength(1);
+      expect(turns[0].turnId).toBe('turn-modern');
+      expect(turns[0].messages.map(message => message.content)).toEqual(['Current']);
+    });
+  });
+
+  describe('parseCodexSessionContent - context_compacted boundary', () => {
+    it.each([false, true])('restores record-only compaction and deduplicates its event (event: %s)', (withEvent) => {
+      const records = [
+        { type: 'event_msg', payload: { type: 'task_started', turn_id: 'compacted-turn' } },
+        { type: 'event_msg', payload: { type: 'agent_message', message: 'Before' } },
+        { type: 'compacted', payload: { message: 'Hidden summary', replacement_history: [
+          { type: 'message', role: 'user', content: [{ type: 'input_text', text: 'Hidden replacement' }] },
+        ] } },
+        ...(withEvent ? [{ type: 'event_msg', payload: { type: 'context_compacted' } }] : []),
+        { type: 'event_msg', payload: { type: 'agent_message', message: 'After' } },
+        { type: 'event_msg', payload: { type: 'task_complete', turn_id: 'compacted-turn' } },
+      ];
+      const content = records.map((record, seconds) => JSON.stringify({ timestamp: testTime({ seconds }), ...record })).join('\n');
+
+      const turns = parseCodexSessionTurns(content);
+      expect(turns).toHaveLength(1);
+      expect(turns[0].turnId).toBe('compacted-turn');
+      expect(turns[0].messages.map(message => ({ content: message.content, blocks: message.contentBlocks }))).toEqual([
+        { content: 'Before', blocks: [{ type: 'text', content: 'Before' }] },
+        { content: '', blocks: [{ type: 'context_compacted' }] },
+        { content: 'After', blocks: [{ type: 'text', content: 'After' }] },
+      ]);
+    });
+
+    it('keeps repeated record-only and event-only compactions distinct', () => {
+      const records = [
+        { type: 'compacted', payload: { message: 'Hidden first summary' } },
+        { type: 'compacted', payload: { message: 'Hidden second summary' } },
+        { type: 'event_msg', payload: { type: 'context_compacted' } },
+        { type: 'event_msg', payload: { type: 'agent_message', message: 'Between boundaries' } },
+        { type: 'event_msg', payload: { type: 'context_compacted' } },
+      ];
+      const content = records.map((record, seconds) => JSON.stringify({ timestamp: testTime({ seconds }), ...record })).join('\n');
+      expect(parseCodexSessionContent(content).map(message => message.contentBlocks)).toEqual([
+        [{ type: 'context_compacted' }],
+        [{ type: 'context_compacted' }],
+        [{ type: 'text', content: 'Between boundaries' }],
+        [{ type: 'context_compacted' }],
+      ]);
+    });
+
+    it('keeps post-compaction records in the active turn when auto-compaction happens mid-turn', () => {
+      const content = [
+        JSON.stringify({
+          timestamp: '2026-07-05T07:19:07.987Z',
+          type: 'event_msg',
+          payload: { type: 'task_started', turn_id: 'uuid-auto-compact' },
+        }),
+        JSON.stringify({
+          timestamp: '2026-07-05T07:19:10.303Z',
+          type: 'response_item',
+          payload: {
+            type: 'message',
+            role: 'user',
+            content: [{ type: 'input_text', text: 'Update the template.' }],
+          },
+        }),
+        JSON.stringify({
+          timestamp: '2026-07-05T07:19:54.927Z',
+          type: 'event_msg',
+          payload: { type: 'agent_message', message: 'I will update the template.' },
+        }),
+        JSON.stringify({
+          timestamp: '2026-07-05T07:19:54.927Z',
+          type: 'response_item',
+          payload: {
+            type: 'message',
+            role: 'assistant',
+            content: [{ type: 'output_text', text: 'I will update the template.' }],
+          },
+        }),
+        JSON.stringify({
+          timestamp: '2026-07-05T07:20:02.971Z',
+          type: 'response_item',
+          payload: {
+            type: 'function_call',
+            name: 'exec_command',
+            call_id: 'call-before-compact',
+            arguments: '{"cmd":"rg breadcrumb template"}',
+          },
+        }),
+        JSON.stringify({
+          timestamp: '2026-07-05T07:20:03.061Z',
+          type: 'response_item',
+          payload: {
+            type: 'function_call_output',
+            call_id: 'call-before-compact',
+            output: 'Process exited with code 0\nOutput:\nmatch',
+          },
+        }),
+        JSON.stringify({
+          timestamp: '2026-07-05T07:23:48.653Z',
+          type: 'compacted',
+          payload: { message: '', replacement_history: [] },
+        }),
+        JSON.stringify({
+          timestamp: '2026-07-05T07:23:48.660Z',
+          type: 'event_msg',
+          payload: { type: 'context_compacted' },
+        }),
+        JSON.stringify({
+          timestamp: '2026-07-05T07:23:52.499Z',
+          type: 'response_item',
+          payload: {
+            type: 'function_call',
+            name: 'exec_command',
+            call_id: 'call-after-compact',
+            arguments: '{"cmd":"npm test"}',
+          },
+        }),
+        JSON.stringify({
+          timestamp: '2026-07-05T07:23:52.934Z',
+          type: 'response_item',
+          payload: {
+            type: 'function_call_output',
+            call_id: 'call-after-compact',
+            output: 'Process exited with code 0\nOutput:\npassed',
+          },
+        }),
+        JSON.stringify({
+          timestamp: '2026-07-05T07:25:41.421Z',
+          type: 'event_msg',
+          payload: { type: 'agent_message', message: 'Template updated.' },
+        }),
+        JSON.stringify({
+          timestamp: '2026-07-05T07:25:41.424Z',
+          type: 'response_item',
+          payload: {
+            type: 'message',
+            role: 'assistant',
+            content: [{ type: 'output_text', text: 'Template updated.' }],
+          },
+        }),
+        JSON.stringify({
+          timestamp: '2026-07-05T07:25:41.432Z',
+          type: 'event_msg',
+          payload: { type: 'task_complete', turn_id: 'uuid-auto-compact' },
+        }),
+      ].join('\n');
+
+      const turns = parseCodexSessionTurns(content);
+
+      expect(turns).toHaveLength(1);
+      expect(turns[0].turnId).toBe('uuid-auto-compact');
+      expect(turns[0].messages.map(message => ({
+        role: message.role,
+        content: message.content,
+        blockTypes: message.contentBlocks?.map(block => block.type),
+        tools: message.toolCalls?.map(tool => tool.id),
+      }))).toEqual([
+        {
+          role: 'user',
+          content: 'Update the template.',
+          blockTypes: undefined,
+          tools: undefined,
+        },
+        {
+          role: 'assistant',
+          content: 'I will update the template.',
+          blockTypes: ['text', 'tool_use'],
+          tools: ['call-before-compact'],
+        },
+        {
+          role: 'assistant',
+          content: '',
+          blockTypes: ['context_compacted'],
+          tools: undefined,
+        },
+        {
+          role: 'assistant',
+          content: 'Template updated.',
+          blockTypes: ['tool_use', 'text'],
+          tools: ['call-after-compact'],
+        },
+      ]);
+    });
+
+    it('preserves visible transcript records instead of replaying compacted replacement_history', () => {
+      const content = [
+        JSON.stringify({ timestamp: '2026-03-03T16:00:00.000Z', type: 'event_msg', payload: { type: 'task_started' } }),
+        JSON.stringify({ timestamp: '2026-03-03T16:00:01.000Z', type: 'response_item', payload: { type: 'message', role: 'user', content: [{ type: 'input_text', text: 'hello' }] } }),
+        JSON.stringify({ timestamp: '2026-03-03T16:00:01.500Z', type: 'response_item', payload: { type: 'function_call', name: 'exec_command', call_id: 'call-1', arguments: '{"cmd":"npm test"}' } }),
+        JSON.stringify({ timestamp: '2026-03-03T16:00:01.700Z', type: 'response_item', payload: { type: 'function_call_output', call_id: 'call-1', output: 'Process exited with code 0\nOutput:\npassed' } }),
+        JSON.stringify({ timestamp: '2026-03-03T16:00:02.000Z', type: 'response_item', payload: { type: 'message', role: 'assistant', content: [{ type: 'output_text', text: 'Hi there!' }] } }),
+        JSON.stringify({ timestamp: '2026-03-03T16:00:03.000Z', type: 'event_msg', payload: { type: 'task_complete' } }),
+        JSON.stringify({ timestamp: '2026-03-03T16:00:03.500Z', type: 'event_msg', payload: { type: 'task_started' } }),
+        // Compaction replacement_history is provider context, not visible UI history.
+        JSON.stringify({
+          timestamp: '2026-03-03T16:00:04.000Z',
+          type: 'compacted',
+          payload: {
+            message: '',
+            replacement_history: [
+              {
+                type: 'message',
+                role: 'user',
+                content: [{ type: 'input_text', text: '<COMPACTION_SUMMARY>\nSummary after compact' }],
+              },
+              {
+                type: 'message',
+                role: 'user',
+                content: [{ type: 'input_text', text: 'replacement-only user message' }],
+              },
+              {
+                type: 'compaction',
+                encrypted_content: 'encrypted-summary',
+              },
+            ],
+          },
+        }),
+        JSON.stringify({ timestamp: '2026-03-03T16:00:04.000Z', type: 'event_msg', payload: { type: 'context_compacted' } }),
+        // Next turn after compaction
+        JSON.stringify({ timestamp: '2026-03-03T16:00:05.000Z', type: 'event_msg', payload: { type: 'task_started' } }),
+        JSON.stringify({ timestamp: '2026-03-03T16:00:06.000Z', type: 'response_item', payload: { type: 'message', role: 'user', content: [{ type: 'input_text', text: 'continue' }] } }),
+        JSON.stringify({ timestamp: '2026-03-03T16:00:07.000Z', type: 'response_item', payload: { type: 'message', role: 'assistant', content: [{ type: 'output_text', text: 'Continuing after compact.' }] } }),
+        JSON.stringify({ timestamp: '2026-03-03T16:00:08.000Z', type: 'event_msg', payload: { type: 'task_complete' } }),
+      ].join('\n');
+
+      const messages = parseCodexSessionContent(content);
+
+      expect(messages.map(m => m.content)).toContain('hello');
+      expect(messages.map(m => m.content)).toContain('Hi there!');
+      expect(messages.map(m => m.content)).not.toContain('<COMPACTION_SUMMARY>\nSummary after compact');
+      expect(messages.map(m => m.content)).not.toContain('replacement-only user message');
+
+      const firstAssistant = messages.find(m => m.role === 'assistant' && m.content === 'Hi there!');
+      expect(firstAssistant).toBeDefined();
+      expect(firstAssistant!.toolCalls).toHaveLength(1);
+      expect(firstAssistant!.toolCalls![0]).toMatchObject({
+        id: 'call-1',
+        name: 'Bash',
+        status: 'completed',
+      });
+
+      expect(messages[0]).toMatchObject({
+        role: 'user',
+        content: 'hello',
+      });
+
+      const compactMsg = messages.find(m =>
+        m.contentBlocks?.some(b => b.type === 'context_compacted'),
+      );
+      expect(compactMsg).toBeDefined();
+      expect(compactMsg!.role).toBe('assistant');
+      expect(compactMsg!.content).toBe('');
+
+      // context_compacted should appear after the preserved pre-compaction transcript.
+      const compactIdx = messages.indexOf(compactMsg!);
+      expect(compactIdx).toBeGreaterThan(0);
+
+      const beforeCompact = messages[compactIdx - 1];
+      expect(beforeCompact.role).toBe('assistant');
+      expect(beforeCompact.content).toBe('Hi there!');
+
+      const afterCompact = messages[compactIdx + 1];
+      expect(afterCompact.role).toBe('user');
+      expect(afterCompact.content).toContain('continue');
+    });
+
+    it('renders compact boundaries without surfacing replacement_history summaries', () => {
+      const content = [
+        JSON.stringify({
+          timestamp: '2026-03-03T16:00:00.000Z',
+          type: 'compacted',
+          payload: {
+            message: '',
+            replacement_history: [
+              {
+                type: 'message',
+                role: 'user',
+                content: [{ type: 'input_text', text: 'First summary' }],
+              },
+            ],
+          },
+        }),
+        JSON.stringify({ timestamp: '2026-03-03T16:00:00.000Z', type: 'event_msg', payload: { type: 'context_compacted' } }),
+        JSON.stringify({
+          timestamp: '2026-03-03T16:00:01.000Z',
+          type: 'compacted',
+          payload: {
+            message: '',
+            replacement_history: [
+              {
+                type: 'message',
+                role: 'user',
+                content: [{ type: 'input_text', text: 'Second summary' }],
+              },
+            ],
+          },
+        }),
+        JSON.stringify({ timestamp: '2026-03-03T16:00:01.000Z', type: 'event_msg', payload: { type: 'context_compacted' } }),
+      ].join('\n');
+
+      const messages = parseCodexSessionContent(content);
+
+      expect(messages).toHaveLength(2);
+      expect(messages.map(m => m.content)).not.toContain('First summary');
+      expect(messages.map(m => m.content)).not.toContain('Second summary');
+      const compactMessages = messages.filter(m =>
+        m.contentBlocks?.some(b => b.type === 'context_compacted'),
+      );
+      expect(compactMessages).toHaveLength(2);
+    });
+  });
+});
+
+it.each([false, true])('restores direct main-thread turn usage without counting child snapshots (aborted: %s)', (aborted) => {
+  const records = [
+    { type: 'session_meta', payload: { id: 'main' } },
+    { type: 'event_msg', payload: { type: 'task_started', turn_id: 'turn' } },
+    { type: 'event_msg', payload: { type: 'user_message', message: 'Work' } },
+    { type: 'token_usage_record', payload: { thread_id: 'main', turn_id: 'turn', turn_token_usage: { output_tokens: 100 } } },
+    { type: 'token_usage_record', payload: { thread_id: 'main', turn_id: 'turn', turn_token_usage: { output_tokens: 125 } } },
+    { type: 'token_usage_record', payload: { thread_id: 'child', turn_id: 'turn', session_id: 'main', root_turn_id: 'turn', turn_token_usage: { output_tokens: 900 } } },
+    { type: 'response_item', payload: { type: 'message', role: 'assistant', content: [{ type: 'output_text', text: 'Done' }] } },
+    { type: 'event_msg', payload: { type: aborted ? 'turn_aborted' : 'task_complete', thread_id: 'main', turn_id: 'turn', duration_ms: 2500 } },
+  ].map((record, i) => JSON.stringify({ timestamp: testTime({ milliseconds: i * 400 }), ...record })).join('\n');
+  const messages = parseCodexSessionContent(records);
+  expect(messages.at(-1)?.turnStats).toEqual(aborted ? undefined : { outputTokens: 125, durationMs: 2500 });
+});
+
+it('retains native turn usage when response-item user records replace the initial parser turn', () => {
+  const content = [
+    { type: 'session_meta', payload: { id: 'main' } },
+    { type: 'event_msg', payload: { type: 'task_started', turn_id: 'turn' } },
+    { type: 'response_item', payload: { type: 'message', role: 'user', content: [{ type: 'input_text', text: 'Work' }] } },
+    { type: 'token_usage_record', payload: { thread_id: 'main', turn_id: 'turn', turn_token_usage: { output_tokens: 125 } } },
+    { type: 'response_item', payload: { type: 'message', role: 'assistant', content: [{ type: 'output_text', text: 'Done' }] } },
+    { type: 'event_msg', payload: { type: 'task_complete', turn_id: 'turn', duration_ms: 2500 } },
+  ].map((record, i) => JSON.stringify({ timestamp: new Date(1000 + i * 500).toISOString(), ...record })).join('\n');
+  expect(parseCodexSessionContent(content).at(-1)?.turnStats).toEqual({ outputTokens: 125, durationMs: 2500 });
+});
+
+it('keeps fork ownership when the rollout contains inherited parent metadata', () => {
+  const content = [
+    { type: 'session_meta', payload: { id: 'fork', forked_from_id: 'parent' } },
+    { type: 'session_meta', payload: { id: 'parent' } },
+    ...['first', 'later'].flatMap(turnId => [
+      { type: 'event_msg', payload: { type: 'task_started', turn_id: turnId } },
+      { type: 'response_item', payload: { type: 'message', role: 'user', content: [{ type: 'input_text', text: 'Work' }] } },
+      { type: 'token_usage_record', payload: { thread_id: 'fork', turn_id: turnId, turn_token_usage: { output_tokens: 125 } } },
+      { type: 'token_usage_record', payload: { thread_id: 'parent', turn_id: turnId, turn_token_usage: { output_tokens: 900 } } },
+      { type: 'token_usage_record', payload: { thread_id: 'child', turn_id: turnId, turn_token_usage: { output_tokens: 700 } } },
+      { type: 'response_item', payload: { type: 'message', role: 'assistant', content: [{ type: 'output_text', text: 'Done' }] } },
+      { type: 'event_msg', payload: { type: 'task_complete', turn_id: turnId, duration_ms: 2500 } },
+    ]),
+  ].map((record, i) => JSON.stringify({ timestamp: new Date(1000 + i * 500).toISOString(), ...record })).join('\n');
+  const replies = parseCodexSessionContent(content).filter(message => message.role === 'assistant');
+  expect(replies.map(message => message.turnStats)).toEqual([
+    { outputTokens: 125, durationMs: 2500 },
+    { outputTokens: 125, durationMs: 2500 },
+  ]);
+});

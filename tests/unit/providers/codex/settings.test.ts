@@ -1,0 +1,560 @@
+import { CODEX_SPARK_MODEL, TEST_CODEX_CATALOG } from '@test/helpers/codexModels';
+
+import { getInstallationKey } from '@/core/device/InstallationKey';
+import { resolveCodexReasoningSummary } from '@/providers/codex/config';
+import {
+  DEFAULT_CODEX_PROVIDER_SETTINGS,
+  getVisibleCodexModelIds,
+  normalizeCodexModelAliases,
+  normalizeCodexVisibleModels,
+} from '@/providers/codex/config';
+import {
+  applyCodexModelDefaults,
+  getCodexProviderSettings,
+  normalizeCodexStoredConfig,
+  projectCodexModelSettings,
+  updateCodexProviderSettings,
+} from '@/providers/codex/settings';
+const originalPlatform = process.platform;
+
+describe('codex settings', () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+  });
+
+  afterEach(() => {
+    Object.defineProperty(process, 'platform', { value: originalPlatform });
+  });
+
+  it.each(['pragmatic', 'friendly', 'none'] as const)('persists the %s response style while stripping retired manual model settings', (responseStyle) => {
+    const settings = { providerConfigs: { codex: { customModels: 'custom' } } };
+    updateCodexProviderSettings(settings, { responseStyle });
+    expect(getCodexProviderSettings(settings)).toMatchObject({ responseStyle });
+    expect(settings.providerConfigs.codex).not.toHaveProperty('customModels');
+  });
+
+  it.each([undefined, null, '', 'invalid', 42, {}, []])('normalizes invalid response style %o to pragmatic', (responseStyle) => {
+    const settings = { providerConfigs: { codex: { responseStyle } } };
+    expect(getCodexProviderSettings(settings)).toMatchObject({ responseStyle: 'pragmatic' });
+    expect(normalizeCodexStoredConfig(settings).config).toMatchObject({ responseStyle: 'pragmatic' });
+  });
+
+  it.each(['default', 'low', 'medium', 'high'] as const)('persists %s response verbosity', (responseVerbosity) => {
+    const settings = {};
+    updateCodexProviderSettings(settings, { responseVerbosity });
+    expect(getCodexProviderSettings(settings).responseVerbosity).toBe(responseVerbosity);
+    expect(normalizeCodexStoredConfig(settings).config.responseVerbosity).toBe(responseVerbosity);
+  });
+
+  it.each([undefined, null, '', 'invalid', 42, {}, []])('inherits Codex verbosity for invalid saved value %o', (responseVerbosity) => {
+    const settings = { providerConfigs: { codex: { responseVerbosity } } };
+    expect(getCodexProviderSettings(settings).responseVerbosity).toBe('default');
+    expect(normalizeCodexStoredConfig(settings).config.responseVerbosity).toBe('default');
+  });
+
+  it('defaults installationMethod to native-windows, ultra effort off, and leaves wslDistroOverride empty', () => {
+    const settings = getCodexProviderSettings({});
+
+    expect(settings).not.toHaveProperty('customModels');
+    expect(settings.modelAliases).toEqual({});
+    expect(settings.visibleModels).toBeNull();
+    expect(settings.enableUltraEffort).toBe(false);
+    expect(settings.installationMethod).toBe('native-windows');
+    expect(settings.wslDistroOverride).toBe('');
+    expect(settings.installationMethod).toBe(DEFAULT_CODEX_PROVIDER_SETTINGS.installationMethod);
+    expect(settings.wslDistroOverride).toBe(DEFAULT_CODEX_PROVIDER_SETTINGS.wslDistroOverride);
+  });
+
+  it('rejects arrays and filters mixed hostname string maps', () => {
+    expect(getCodexProviderSettings({
+      providerConfigs: {
+        codex: {
+          cliPathsByHost: ['/array/codex'],
+          wslDistroOverridesByHost: {
+            [` ${getInstallationKey()} `]: ' Ubuntu ',
+            invalid: 42,
+          },
+        },
+      },
+    })).toMatchObject({
+      cliPathsByHost: {},
+      wslDistroOverridesByHost: { [getInstallationKey()]: 'Ubuntu' },
+    });
+  });
+
+  it('canonically normalizes hostname installation method maps before enum handling', () => {
+    Object.defineProperty(process, 'platform', { value: 'win32' });
+    const persisted = Object.create({ inherited: 'wsl' }) as Record<string, unknown>;
+    Object.defineProperty(persisted, ' legacy-host ', {
+      enumerable: true,
+      value: ' wsl ',
+    });
+    Object.defineProperty(persisted, 'malformed-host', {
+      enumerable: true,
+      value: 42,
+    });
+    Object.defineProperty(persisted, '__proto__', {
+      enumerable: true,
+      value: 'native-windows',
+    });
+
+    const methods = getCodexProviderSettings({
+      providerConfigs: {
+        codex: { installationMethodsByHost: persisted },
+      },
+    }).installationMethodsByHost;
+
+    expect(methods['legacy-host']).toBe('wsl');
+    expect(methods.__proto__).toBe('native-windows');
+    expect(Object.keys(methods).sort()).toEqual(['__proto__', 'legacy-host']);
+    expect(Object.getPrototypeOf(methods)).toBe(Object.prototype);
+    expect(Object.prototype.hasOwnProperty.call(methods, '__proto__')).toBe(true);
+    expect(Object.prototype.hasOwnProperty.call(methods, 'inherited')).toBe(false);
+  });
+
+  it('treats a null visibility filter as all discovered models', () => {
+    const discoveredModels = [
+      { ...TEST_CODEX_CATALOG[0], model: 'gpt-5.5' },
+      { ...TEST_CODEX_CATALOG[1], model: 'gpt-5.4-mini' },
+    ];
+
+    expect(getVisibleCodexModelIds(null, discoveredModels)).toEqual([
+      'gpt-5.5',
+      'gpt-5.4-mini',
+    ]);
+  });
+
+  it('normalizes explicit visible models while retaining unavailable selections', () => {
+    expect(normalizeCodexVisibleModels(
+      [' gpt-5.4-mini ', 'missing-model', 'gpt-5.4-mini', 42]
+    )).toEqual(['gpt-5.4-mini', 'missing-model']);
+    expect(normalizeCodexVisibleModels(undefined)).toBeNull();
+  });
+
+  it('normalizes model aliases while retaining unknown model ids', () => {
+    const input = Object.setPrototypeOf(JSON.parse(
+      '{" gpt-5.5 ":"  Primary  ","gpt-5.4-mini":" ","missing":"Missing","invalid":42," ":"Blank key","__proto__":" Custom Proto ","constructor":"Custom Constructor"}',
+    ), { inherited: 'Ignore' });
+    const aliases = normalizeCodexModelAliases(input);
+
+    expect(aliases).toEqual(JSON.parse(
+      '{"gpt-5.5":"Primary","missing":"Missing","__proto__":"Custom Proto","constructor":"Custom Constructor"}',
+    ));
+    expect(Object.keys(aliases)).toEqual(['gpt-5.5', 'missing', '__proto__', 'constructor']);
+    expect(Object.getPrototypeOf(aliases)).toBe(Object.prototype);
+    expect(Object.getOwnPropertyDescriptor(aliases, '__proto__')).toEqual({
+      value: 'Custom Proto', enumerable: true, writable: true, configurable: true,
+    });
+    expect(JSON.parse(JSON.stringify(aliases))).toEqual(aliases);
+  });
+
+  it.each([null, undefined, 'alias', 42, []])('ignores non-record aliases: %o', value => {
+    expect(normalizeCodexModelAliases(value)).toEqual({});
+  });
+
+  it('persists aliases only for visible models', () => {
+    const settingsBag: Record<string, unknown> = {
+      providerConfigs: {
+        codex: {
+          discoveredModels: TEST_CODEX_CATALOG,
+          visibleModels: null,
+        },
+      },
+    };
+
+    updateCodexProviderSettings(settingsBag, {
+      modelAliases: {
+        'gpt-5.4-mini': 'Mini',
+        'gpt-5.5': 'Primary',
+      },
+    });
+    updateCodexProviderSettings(settingsBag, { visibleModels: ['gpt-5.5'] });
+
+    expect(getCodexProviderSettings(settingsBag).modelAliases).toEqual({
+      'gpt-5.5': 'Primary',
+    });
+  });
+
+  it('normalizes and persists the app-server model catalog', () => {
+    const settingsBag: Record<string, unknown> = {
+      providerConfigs: {
+        codex: {
+          discoveredModels: [{
+            id: 'gpt-5.6-sol',
+            model: 'gpt-5.6-sol',
+            displayName: 'GPT-5.6-Sol',
+            description: 'Latest frontier agentic coding model.',
+            hidden: false,
+            supportedReasoningEfforts: [
+              { reasoningEffort: 'low', description: 'Fast' },
+              { reasoningEffort: 'ultra', description: 'Automatic task delegation' },
+            ],
+            defaultReasoningEffort: 'low',
+            serviceTiers: [{ id: 'priority', name: 'Fast', description: '1.5x speed' }],
+            defaultServiceTier: null,
+            inputModalities: ['text', 'image'],
+            isDefault: true,
+          }],
+        },
+      },
+    };
+
+    const discoveredModels = getCodexProviderSettings(settingsBag).discoveredModels;
+    expect(discoveredModels[0]).toMatchObject({
+      model: 'gpt-5.6-sol',
+      defaultReasoningEffort: 'low',
+      supportedReasoningEfforts: [
+        { value: 'low', description: 'Fast' },
+        { value: 'ultra', description: 'Automatic task delegation' },
+      ],
+    });
+
+    updateCodexProviderSettings(settingsBag, { discoveredModels });
+    expect(settingsBag).toMatchObject({
+      providerConfigs: {
+        codex: {
+          discoveredModels,
+        },
+      },
+    });
+  });
+
+  it('persists ultra effort as an explicit Codex opt-in', () => {
+    const settingsBag: Record<string, unknown> = {};
+
+    updateCodexProviderSettings(settingsBag, { enableUltraEffort: true });
+
+    expect(getCodexProviderSettings(settingsBag).enableUltraEffort).toBe(true);
+    expect(settingsBag).toMatchObject({
+      providerConfigs: {
+        codex: {
+          enableUltraEffort: true,
+        },
+      },
+    });
+  });
+
+  it('preserves global Codex projections when their model is hidden', () => {
+    const settingsBag: Record<string, unknown> = {
+      settingsProvider: 'codex',
+      model: 'gpt-5.5',
+      effortLevel: 'high',
+      serviceTier: 'priority',
+      titleGenerationModel: 'gpt-5.5',
+      savedProviderModel: { codex: 'gpt-5.5' },
+      savedProviderEffort: { codex: 'high' },
+      savedProviderServiceTier: { codex: 'priority' },
+      providerConfigs: {
+        codex: {
+          discoveredModels: TEST_CODEX_CATALOG,
+          visibleModels: null,
+        },
+      },
+    };
+
+    updateCodexProviderSettings(settingsBag, { visibleModels: ['gpt-5.4-mini'] });
+
+    expect(settingsBag).toMatchObject({
+      model: 'gpt-5.5',
+      effortLevel: 'high',
+      serviceTier: 'priority',
+      titleGenerationModel: 'gpt-5.5',
+      savedProviderModel: { codex: 'gpt-5.5' },
+      savedProviderEffort: { codex: 'high' },
+      savedProviderServiceTier: { codex: 'priority' },
+    });
+  });
+
+  it('preserves projections when only another ordered model is available', () => {
+    const ultraOnlyModel = {
+      ...TEST_CODEX_CATALOG[1],
+      model: 'gpt-ultra-only',
+      displayName: 'GPT Ultra Only',
+      supportedReasoningEfforts: [{ value: 'ultra', description: 'Ultra' }],
+    };
+    const settingsBag: Record<string, unknown> = {
+      settingsProvider: 'codex',
+      model: 'gpt-5.5',
+      savedProviderModel: { codex: 'gpt-5.5' },
+      providerConfigs: {
+        codex: {
+          discoveredModels: [ultraOnlyModel, ...TEST_CODEX_CATALOG],
+          enableUltraEffort: false,
+          visibleModels: null,
+        },
+      },
+    };
+
+    updateCodexProviderSettings(settingsBag, {
+      visibleModels: ['gpt-ultra-only', 'gpt-5.4-mini'],
+    });
+
+    expect(settingsBag).toMatchObject({
+      model: 'gpt-5.5',
+      savedProviderModel: { codex: 'gpt-5.5' },
+    });
+  });
+
+  it('normalizes invalid installationMethod and wslDistroOverride values', () => {
+    const settings = getCodexProviderSettings({
+      providerConfigs: {
+        codex: {
+          installationMethod: 'auto',
+          wslDistroOverride: 123,
+        },
+      },
+    });
+
+    expect(settings.installationMethod).toBe('native-windows');
+    expect(settings.wslDistroOverride).toBe('');
+  });
+
+  it('does not inherit another host installation method once host-scoped values exist', () => {
+    const settings = getCodexProviderSettings({
+      providerConfigs: {
+        codex: {
+          installationMethodsByHost: {
+            'host-b': 'wsl',
+          },
+          wslDistroOverridesByHost: {
+            'host-b': 'Ubuntu',
+          },
+          installationMethod: 'wsl',
+          wslDistroOverride: 'Ubuntu',
+        },
+      },
+    });
+
+    expect(settings.installationMethod).toBe('native-windows');
+    expect(settings.wslDistroOverride).toBe('');
+  });
+
+  it('preserves hostname-scoped settings without assigning them to the current device', () => {
+
+    const settings = getCodexProviderSettings({
+      providerConfigs: {
+        codex: {
+          cliPathsByHost: {
+            'host-a': '/host-a/codex',
+            'host-b': '/host-b/codex',
+          },
+          installationMethodsByHost: {
+            'host-a': 'wsl',
+            'host-b': 'native-windows',
+          },
+          wslDistroOverridesByHost: {
+            'host-a': 'Ubuntu',
+            'host-b': 'Debian',
+          },
+        },
+      },
+    });
+
+    expect(settings.cliPathsByHost).toEqual({
+      'host-a': '/host-a/codex',
+      'host-b': '/host-b/codex',
+    });
+    expect(settings.installationMethod).toBe('native-windows');
+    expect(settings.installationMethodsByHost).toEqual({
+      'host-a': 'wsl',
+      'host-b': 'native-windows',
+    });
+    expect(settings.wslDistroOverride).toBe('');
+    expect(settings.wslDistroOverridesByHost).toEqual({
+      'host-a': 'Ubuntu',
+      'host-b': 'Debian',
+    });
+  });
+
+  it('round-trips installationMethod and trims wslDistroOverride on update for the current host', () => {
+    Object.defineProperty(process, 'platform', { value: 'win32' });
+    const settingsBag: Record<string, unknown> = {
+      providerConfigs: {
+        codex: {},
+      },
+    };
+
+    const next = updateCodexProviderSettings(settingsBag, {
+      installationMethod: 'wsl',
+      wslDistroOverride: '  Ubuntu-24.04  ',
+    });
+
+    expect(next.installationMethod).toBe('wsl');
+    expect(next.wslDistroOverride).toBe('Ubuntu-24.04');
+    expect(getCodexProviderSettings(settingsBag)).toMatchObject({
+      installationMethod: 'wsl',
+      wslDistroOverride: 'Ubuntu-24.04',
+      installationMethodsByHost: {
+        [getInstallationKey()]: 'wsl',
+      },
+      wslDistroOverridesByHost: {
+        [getInstallationKey()]: 'Ubuntu-24.04',
+      },
+    });
+  });
+
+  it('preserves another host installation settings when updating the current host', () => {
+    Object.defineProperty(process, 'platform', { value: 'win32' });
+    const settingsBag: Record<string, unknown> = {
+      providerConfigs: {
+        codex: {
+          installationMethodsByHost: {
+            'host-b': 'wsl',
+          },
+          wslDistroOverridesByHost: {
+            'host-b': 'Debian',
+          },
+        },
+      },
+    };
+
+    const next = updateCodexProviderSettings(settingsBag, {
+      installationMethod: 'native-windows',
+      wslDistroOverride: '  ',
+    });
+
+    expect(next.installationMethodsByHost).toEqual({
+      'host-b': 'wsl',
+      [getInstallationKey()]: 'native-windows',
+    });
+    expect(next.wslDistroOverridesByHost).toEqual({
+      'host-b': 'Debian',
+    });
+  });
+
+  it('does not persist Windows installation settings on non-Windows hosts', () => {
+    Object.defineProperty(process, 'platform', { value: 'darwin' });
+    const settingsBag: Record<string, unknown> = {
+      providerConfigs: {
+        codex: {
+          installationMethodsByHost: {
+            [getInstallationKey()]: 'wsl',
+            'host-b': 'wsl',
+          },
+          wslDistroOverridesByHost: {
+            [getInstallationKey()]: 'Ubuntu-24.04',
+            'host-b': 'Debian',
+          },
+        },
+      },
+    };
+
+    const next = updateCodexProviderSettings(
+      settingsBag,
+      getCodexProviderSettings(settingsBag),
+    );
+
+    expect(next.installationMethod).toBe(DEFAULT_CODEX_PROVIDER_SETTINGS.installationMethod);
+    expect(next.installationMethodsByHost).toEqual({
+      'host-b': 'wsl',
+    });
+    expect(next.wslDistroOverride).toBe(DEFAULT_CODEX_PROVIDER_SETTINGS.wslDistroOverride);
+    expect(next.wslDistroOverridesByHost).toEqual({
+      'host-b': 'Debian',
+    });
+    expect(getCodexProviderSettings(settingsBag).installationMethodsByHost).toEqual({
+      'host-b': 'wsl',
+    });
+    expect(getCodexProviderSettings(settingsBag).wslDistroOverridesByHost).toEqual({
+      'host-b': 'Debian',
+    });
+  });
+
+  it('normalizes stored Codex config without treating effective defaults as persisted fields', () => {
+    const result = normalizeCodexStoredConfig(
+      {
+        providerConfigs: {
+          codex: {
+            enabled: true,
+            installationMethod: 'native-windows',
+            wslDistroOverride: '',
+            installationMethodsByHost: {
+              [getInstallationKey()]: 'wsl',
+              'host-b': 'wsl',
+            },
+            wslDistroOverridesByHost: {
+              [getInstallationKey()]: 'Ubuntu-24.04',
+              'host-b': 'Debian',
+            },
+          },
+        },
+      },
+      {
+        platform: 'darwin',
+        hostnameKey: getInstallationKey(),
+      },
+    );
+
+    expect(result.changed).toBe(true);
+    expect(result.config).toMatchObject({
+      enabled: true,
+      installationMethodsByHost: {
+        'host-b': 'wsl',
+      },
+      wslDistroOverridesByHost: {
+        'host-b': 'Debian',
+      },
+    });
+    expect(result.config).toHaveProperty('installationMethod');
+    expect(result.config).toHaveProperty('wslDistroOverride');
+  });
+
+  it('does not import retired Windows installation scalars', () => {
+    const result = normalizeCodexStoredConfig(
+      {
+        providerConfigs: {
+          codex: {
+            installationMethod: 'wsl',
+            wslDistroOverride: ' Ubuntu ',
+          },
+        },
+      },
+      {
+        platform: 'win32',
+        hostnameKey: getInstallationKey(),
+      },
+    );
+
+    expect(result.changed).toBe(false);
+    expect(result.config.installationMethodsByHost).toEqual({});
+    expect(result.config.wslDistroOverridesByHost).toEqual({});
+    expect(result.config).toHaveProperty('installationMethod');
+    expect(result.config).toHaveProperty('wslDistroOverride');
+  });
+
+  it('forces reasoning summary off for GPT-5.3 Codex Spark', () => {
+    const settingsBag: Record<string, unknown> = {
+      providerConfigs: {
+        codex: {
+          reasoningSummary: 'detailed',
+        },
+      },
+    };
+
+    const codexSettings = getCodexProviderSettings(settingsBag);
+    expect(resolveCodexReasoningSummary(codexSettings, CODEX_SPARK_MODEL)).toBe('none');
+    expect(resolveCodexReasoningSummary(codexSettings, 'gpt-5.5')).toBe('detailed');
+  });
+
+  it('sets reasoning summary off when applying GPT-5.3 Codex Spark model defaults', () => {
+    const settingsBag: Record<string, unknown> = {
+      providerConfigs: {
+        codex: {
+          reasoningSummary: 'detailed',
+        },
+      },
+    };
+
+    applyCodexModelDefaults(CODEX_SPARK_MODEL, settingsBag);
+
+    expect(getCodexProviderSettings(settingsBag).reasoningSummary).toBe('none');
+  });
+});
+
+it('strips legacy manual models when decoding, writing, and projecting settings', () => {
+  const settings = { providerConfigs: { codex: { customModels: 'legacy-endpoint-model' } } };
+  expect(normalizeCodexStoredConfig(settings).config).not.toHaveProperty('customModels');
+  expect(projectCodexModelSettings(settings)).not.toHaveProperty('customModels');
+  updateCodexProviderSettings(settings, { responseStyle: 'friendly' });
+  expect(settings.providerConfigs.codex).not.toHaveProperty('customModels');
+});

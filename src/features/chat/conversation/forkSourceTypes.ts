@@ -1,0 +1,31 @@
+import type { ProviderId } from '@/core/providers/types';
+import type { ChatMessage } from '@/core/types';
+
+export interface ForkContext {
+  messages: ChatMessage[];
+  providerId?: ProviderId;
+  sourceConversationId: string | null;
+  sourceSessionId: string;
+  sourceProviderState?: Record<string, unknown>;
+  sourceSelectedModel?: string;
+  resumeAt: string;
+  sourceTitle?: string;
+  /** 1-based index used for fork title suffix (counts only canonical user messages). */
+  forkAtUserMessage?: number;
+  linkedContentPath?: string;
+  /** The source's raw project id; a fork or side chat resolves it through the live project reader. */
+  projectId?: string;
+}
+
+export type ForkSourceUnavailableReason =
+  | 'unsupported-provider'
+  | 'streaming'
+  | 'rewinding'
+  | 'no-messages'
+  | 'no-checkpoint'
+  | 'no-session'
+  | 'stale-binding';
+
+export type ForkSourceCapture =
+  | { readonly ok: true; readonly context: ForkContext }
+  | { readonly ok: false; readonly reason: ForkSourceUnavailableReason };

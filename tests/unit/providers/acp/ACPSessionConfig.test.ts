@@ -1,0 +1,173 @@
+import { extractACPSessionModelState } from '@/providers/acp';
+
+describe('AcpSessionConfig', () => {
+  it('prefers grouped ACP config model options in order over session model metadata', () => {
+    expect(extractACPSessionModelState({
+      configOptions: [
+        {
+          category: 'model',
+          currentValue: 'anthropic/claude-sonnet-4/high',
+          id: 'selected_model',
+          name: 'Model',
+          options: [
+            {
+              group: 'Anthropic',
+              name: 'Anthropic',
+              options: [
+                { name: 'Anthropic/Claude Sonnet 4', value: 'anthropic/claude-sonnet-4' },
+                { name: 'Anthropic/Claude Sonnet 4 (high)', value: 'anthropic/claude-sonnet-4/high' },
+              ],
+            },
+            {
+              group: 'OpenAI',
+              name: 'OpenAI',
+              options: [{ name: 'OpenAI/GPT-5', value: 'openai/gpt-5' }],
+            },
+          ],
+          type: 'select',
+        },
+      ],
+      models: {
+        availableModels: [
+          { id: 'openai/gpt-5', name: 'OpenAI/GPT-5' },
+        ],
+        currentModelId: 'openai/gpt-5',
+      },
+    })).toEqual({
+      availableModels: [
+        { id: 'anthropic/claude-sonnet-4', name: 'Anthropic/Claude Sonnet 4' },
+        { id: 'anthropic/claude-sonnet-4/high', name: 'Anthropic/Claude Sonnet 4 (high)' },
+        { id: 'openai/gpt-5', name: 'OpenAI/GPT-5' },
+      ],
+      currentModelId: 'anthropic/claude-sonnet-4/high',
+    });
+  });
+
+  it('ignores uncategorized model selectors', () => {
+    expect(extractACPSessionModelState({ configOptions: [{ currentValue: 'model-1', id: 'model', name: 'Model', options: [{ name: 'Model', value: 'model-1' }], type: 'select' }] })).toEqual({ availableModels: [], currentModelId: null });
+  });
+
+  it('falls back to ACP session model metadata when config options are unavailable', () => {
+    expect(extractACPSessionModelState({
+      models: {
+        availableModels: [
+          { description: 'Fast', id: 'openai/gpt-5-mini', name: 'OpenAI/GPT-5 Mini' },
+        ],
+        currentModelId: 'openai/gpt-5-mini',
+      },
+    })).toEqual({
+      availableModels: [
+        { description: 'Fast', id: 'openai/gpt-5-mini', name: 'OpenAI/GPT-5 Mini' },
+      ],
+      currentModelId: 'openai/gpt-5-mini',
+    });
+  });
+
+  it('normalizes standard modelId entries and preserves opaque model metadata', () => {
+    expect(extractACPSessionModelState({
+      models: {
+        _meta: { 'vendor.example/catalog': { revision: 7 } },
+        availableModels: [
+          {
+            _meta: {
+              reasoningEfforts: ['low', 'high'],
+              'vendor.example/model': { contextTokens: 200_000 },
+            },
+            description: 'Standard ACP model entry',
+            modelId: 'model-standard',
+            name: 'Standard Model',
+          },
+        ],
+        currentModelId: 'model-standard',
+      },
+    })).toEqual({
+      _meta: { 'vendor.example/catalog': { revision: 7 } },
+      availableModels: [
+        {
+          _meta: {
+            reasoningEfforts: ['low', 'high'],
+            'vendor.example/model': { contextTokens: 200_000 },
+          },
+          description: 'Standard ACP model entry',
+          id: 'model-standard',
+          name: 'Standard Model',
+        },
+      ],
+      currentModelId: 'model-standard',
+    });
+  });
+
+  it('keeps legacy id model entries compatible while preserving metadata', () => {
+    expect(extractACPSessionModelState({
+      models: {
+        availableModels: [
+          {
+            _meta: { 'vendor.example/model': 'legacy' },
+            id: 'model-legacy',
+            name: 'Legacy Model',
+          },
+        ],
+        currentModelId: 'model-legacy',
+      },
+    })).toEqual({
+      availableModels: [
+        {
+          _meta: { 'vendor.example/model': 'legacy' },
+          id: 'model-legacy',
+          name: 'Legacy Model',
+        },
+      ],
+      currentModelId: 'model-legacy',
+    });
+  });
+
+  it('keeps config-option precedence while preserving session model-state metadata', () => {
+    expect(extractACPSessionModelState({
+      configOptions: [
+        {
+          category: 'model',
+          currentValue: 'config-model',
+          id: 'selected_model',
+          name: 'Model',
+          options: [{ name: 'Config Model', value: 'config-model' }],
+          type: 'select',
+        },
+      ],
+      models: {
+        _meta: { 'vendor.example/catalog': 'session-metadata' },
+        availableModels: [{ modelId: 'session-model', name: 'Session Model' }],
+        currentModelId: 'session-model',
+      },
+    })).toEqual({
+      _meta: { 'vendor.example/catalog': 'session-metadata' },
+      availableModels: [{ id: 'config-model', name: 'Config Model' }],
+      currentModelId: 'config-model',
+    });
+  });
+
+  it('falls back to ACP session model metadata when the config option has no discovered entries', () => {
+    expect(extractACPSessionModelState({
+      configOptions: [
+        {
+          category: 'model',
+          currentValue: 'anthropic/claude-sonnet-4/high',
+          id: 'selected_model',
+          name: 'Model',
+          options: [],
+          type: 'select',
+        },
+      ],
+      models: {
+        availableModels: [
+          { description: 'Fast', id: 'openai/gpt-5-mini', name: 'OpenAI/GPT-5 Mini' },
+        ],
+        currentModelId: 'openai/gpt-5-mini',
+      },
+    })).toEqual({
+      availableModels: [
+        { description: 'Fast', id: 'openai/gpt-5-mini', name: 'OpenAI/GPT-5 Mini' },
+      ],
+      currentModelId: 'openai/gpt-5-mini',
+    });
+  });
+});

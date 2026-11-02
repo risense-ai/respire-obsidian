@@ -1,0 +1,213 @@
+import { diffFromReplacements } from '@/core/tools/toolDiff';
+import type { ToolResultDetails } from '@/core/types';
+import { ACPToolStreamAdapter, type ACPToolStreamPresentationAdapter } from '@/providers/acp/ACPToolStreamAdapter';
+
+function createAdapter(
+  normalizeToolInput: ACPToolStreamPresentationAdapter['normalizeToolInput'] = (_rawName, input) => input,
+): ACPToolStreamAdapter {
+  return new ACPToolStreamAdapter({
+    normalizeToolInput,
+    normalizeToolName: rawName => rawName === 'read_file'
+      ? 'Read'
+      : rawName === 'tool' ? 'Tool' : rawName ?? 'Tool',
+    normalizeToolResultDetails(rawName): ToolResultDetails | undefined {
+      return rawName === 'write' ? { resultFormat: 'plain' } : undefined;
+    },
+    buildToolProviderPayload(rawName, rawInput, rawOutput) {
+      return {
+        ...(rawInput !== undefined ? { rawInput } : {}),
+        rawName,
+        ...(rawOutput !== undefined ? { rawOutput } : {}),
+      };
+    },
+    resolveRawToolName: (current, update) => {
+      if (update.title) return { provenance: 'title', rawName: update.title };
+      if (current) return current;
+      if (update.kind) return { provenance: 'kind', rawName: update.kind };
+      return { provenance: 'fallback', rawName: 'tool' };
+    },
+  });
+}
+
+describe('ACPToolStreamAdapter', () => {
+  it('projects raw snapshots again without re-normalizing presentation input', () => {
+    const adapter = createAdapter((_name, input) => input.arguments as Record<string, unknown>);
+    const rawInput = { arguments: { query: 'old', limit: 3 } };
+    adapter.normalizeToolCall({ title: 'lookup', toolCallId: 'lookup-1', rawInput }, []);
+    expect(adapter.normalizeToolCallUpdate({ toolCallId: 'lookup-1', rawOutput: 'found' }, []))
+      .toEqual([expect.objectContaining({ input: { query: 'old', limit: 3 }, providerPayload: {
+        rawName: 'lookup', rawInput, rawOutput: 'found',
+      } })]);
+
+    const nextRawInput = { arguments: { query: 'new' } };
+    expect(adapter.normalizeToolCallUpdate({ toolCallId: 'lookup-1', rawInput: nextRawInput }, []))
+      .toEqual([expect.objectContaining({ input: { query: 'new' }, providerPayload: {
+        rawName: 'lookup', rawInput: nextRawInput, rawOutput: 'found',
+      } })]);
+  });
+
+  it('carries validated provider payload on tool start and raw-state updates', () => {
+    const adapter = createAdapter();
+    const rawInput = { path: 'private.md', unknown: ['future'] };
+
+    expect(adapter.normalizeToolCall({
+      rawInput,
+      title: 'read_file',
+      toolCallId: 'tool-1',
+    }, [{ id: 'tool-1', input: {}, name: 'read_file', type: 'tool_use' }])).toEqual([{
+      id: 'tool-1',
+      input: rawInput,
+      name: 'Read',
+      providerPayload: { rawInput, rawName: 'read_file' },
+      type: 'tool_use',
+    }]);
+
+    const rawOutput = { partial: { bytes: [1, 2, 3] } };
+    expect(adapter.normalizeToolCallUpdate({
+      rawOutput,
+      toolCallId: 'tool-1',
+    }, [])).toEqual([{
+      id: 'tool-1',
+      input: rawInput,
+      name: 'Read',
+      providerPayload: { rawInput, rawName: 'read_file', rawOutput },
+      type: 'tool_use',
+    }]);
+  });
+
+  it('preserves accumulated raw state across a status-only completion', () => {
+    const adapter = createAdapter();
+    const rawInput = ['opaque'];
+    const rawOutput = { status: 'partial' };
+    adapter.normalizeToolCall({ rawInput, title: 'read_file', toolCallId: 'tool-1' }, [
+      { id: 'tool-1', input: {}, name: 'tool', type: 'tool_use' },
+    ]);
+    adapter.normalizeToolCallUpdate({ rawOutput, toolCallId: 'tool-1' }, []);
+
+    expect(adapter.normalizeToolCallUpdate({
+      status: 'completed',
+      toolCallId: 'tool-1',
+    }, [{ content: 'Concise', id: 'tool-1', type: 'tool_result' }])).toEqual([{
+      content: 'Concise',
+      id: 'tool-1',
+      providerPayload: { rawInput, rawName: 'read_file', rawOutput },
+      type: 'tool_result',
+    }]);
+  });
+
+  it('merges native ACP diff data with provider-owned result metadata', () => {
+    const adapter = createAdapter();
+    const diff = diffFromReplacements([{ oldText: 'old text', newText: 'new text' }], 'src/write.ts');
+    adapter.normalizeToolCall({
+      rawInput: { content: 'new text', file_path: 'src/write.ts' },
+      title: 'write',
+      toolCallId: 'tool-write',
+    }, [{ id: 'tool-write', input: {}, name: 'write', type: 'tool_use' }]);
+
+    expect(adapter.normalizeToolCallUpdate({
+      status: 'completed',
+      toolCallId: 'tool-write',
+    }, [{
+      content: 'Diff: src/write.ts',
+      id: 'tool-write',
+      resultDetails: { diff },
+      type: 'tool_result',
+    }])).toEqual([{
+      content: 'Diff: src/write.ts',
+      id: 'tool-write',
+      resultDetails: { diff, resultFormat: 'plain' },
+      providerPayload: {
+        rawInput: { content: 'new text', file_path: 'src/write.ts' },
+        rawName: 'write',
+      },
+      type: 'tool_result',
+    }]);
+  });
+
+  it('emits a title-only normalized-name refinement and ignores a no-name update', () => {
+    const adapter = createAdapter();
+    expect(adapter.normalizeToolCall({ title: 'tool', toolCallId: 'tool-1' }, [
+      { id: 'tool-1', input: {}, name: 'tool', type: 'tool_use' },
+    ])).toEqual([{
+      id: 'tool-1',
+      input: {},
+      name: 'Tool',
+      providerPayload: { rawName: 'tool' },
+      type: 'tool_use',
+    }]);
+
+    expect(adapter.normalizeToolCallUpdate({
+      title: 'read_file',
+      toolCallId: 'tool-1',
+    }, [])).toEqual([{
+      id: 'tool-1',
+      input: {},
+      name: 'Read',
+      providerPayload: { rawName: 'read_file' },
+      type: 'tool_use',
+    }]);
+
+    expect(adapter.normalizeToolCallUpdate({
+      toolCallId: 'tool-1',
+    }, [])).toEqual([]);
+  });
+
+  it('retains raw-name provenance across multiple late title updates', () => {
+    const adapter = createAdapter();
+    expect(adapter.normalizeToolCall({
+      kind: 'execute',
+      title: '',
+      toolCallId: 'tool-late-title',
+    }, [{ id: 'tool-late-title', input: {}, name: 'tool', type: 'tool_use' }]))
+      .toEqual([{
+        id: 'tool-late-title',
+        input: {},
+        name: 'execute',
+        providerPayload: { rawName: 'execute' },
+        type: 'tool_use',
+      }]);
+
+    expect(adapter.normalizeToolCallUpdate({
+      title: 'future_tool',
+      toolCallId: 'tool-late-title',
+    }, [])).toEqual([{
+      id: 'tool-late-title',
+      input: {},
+      name: 'future_tool',
+      providerPayload: { rawName: 'future_tool' },
+      type: 'tool_use',
+    }]);
+    expect(adapter.normalizeToolCallUpdate({
+      title: 'future_tool_v2',
+      toolCallId: 'tool-late-title',
+    }, [])).toEqual([{
+      id: 'tool-late-title',
+      input: {},
+      name: 'future_tool_v2',
+      providerPayload: { rawName: 'future_tool_v2' },
+      type: 'tool_use',
+    }]);
+    expect(adapter.normalizeToolCallUpdate({ toolCallId: 'tool-late-title' }, []))
+      .toEqual([]);
+  });
+});
+
+it.each([{}, { rawInput: null, rawOutput: null }])('keeps previous raw state for a v1 no-change update: %j', update => {
+  const adapter = createAdapter();
+  const rawInput = { target_file: 'note.md' };
+  const rawOutput = { content: 'note body' };
+  adapter.normalizeToolCall({ title: 'read_file', toolCallId: 'read', rawInput, rawOutput }, []);
+  expect(adapter.normalizeToolCallUpdate({ toolCallId: 'read', ...update }, [
+    { type: 'tool_result', id: 'read', content: 'complete' },
+  ]).at(-1)).toMatchObject({ providerPayload: { rawInput, rawOutput }, content: 'complete' });
+});
+
+it('retains an initial null payload and accepts a later concrete replacement', () => {
+  const adapter = createAdapter();
+  expect(adapter.normalizeToolCall({ title: 'read_file', toolCallId: 'read', rawInput: null, rawOutput: null }, [
+    { type: 'tool_use', id: 'read', name: 'Read', input: {} },
+  ])[0]).toMatchObject({ providerPayload: { rawInput: null, rawOutput: null } });
+  expect(adapter.normalizeToolCallUpdate({ toolCallId: 'read', rawInput: { target_file: 'next.md' }, rawOutput: 'next' }, [
+    { type: 'tool_result', id: 'read', content: 'complete' },
+  ]).at(-1)).toMatchObject({ providerPayload: { rawInput: { target_file: 'next.md' }, rawOutput: 'next' } });
+});

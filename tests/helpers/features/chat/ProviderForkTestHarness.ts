@@ -1,0 +1,126 @@
+import '@/providers';
+
+import * as path from 'node:path';
+
+import { claudeCatalogFixture } from '@test/helpers/claudeModels';
+import { createChatFeatureHost } from '@test/helpers/features/chat/ChatFeatureHostFixture';
+import { writeGrokCatalog } from '@test/helpers/providers/grokSettings';
+
+import { ConversationRepository } from '@/app/conversations/ConversationRepository';
+import { ConversationPersistenceStore } from '@/app/storage/ConversationPersistenceStore';
+import { type ProviderExecutionBackend } from '@/core/execution';
+import { ProviderRegistry } from '@/core/providers/ProviderRegistry';
+import { ProviderSettingsCoordinator } from '@/core/providers/ProviderSettingsCoordinator';
+import type { ProviderHistoryPathContext } from '@/core/providers/types';
+import type { ChatMessage, Conversation, ProviderId } from '@/core/types';
+import { ChatExecutionCoordinator } from '@/features/chat/execution/ChatExecutionCoordinator';
+import { handleForkRequest } from '@/features/chat/sessions/SessionForkSource';
+import type { AssembledTabRuntime } from '@/features/chat/tabs/types';
+
+/** Real persistence/orchestration with only the Obsidian filesystem boundary supplied by the test. */
+export async function createForkTestEnvironment() {
+  const plugin = await createChatFeatureHost({
+    settings: {
+      model: 'claude-sonnet-4-5', permissionMode: 'normal', mediaFolder: 'media',
+      providerConfigs: {
+        claude: claudeCatalogFixture(['claude-sonnet-4-5']),
+        pi: { enabled: true, visibleModels: ['pi:anthropic/claude-sonnet-4'], discoveredModels: [{
+          encodedId: 'pi:anthropic/claude-sonnet-4', id: 'claude-sonnet-4', provider: 'anthropic', label: 'Sonnet', input: ['text'],
+        }] },
+        codex: { enabled: true, visibleModels: ['gpt-5'], discoveredModels: [{ model: 'gpt-5', displayName: 'GPT-5', description: '', supportedReasoningEfforts: [{ value: 'medium', description: '' }], defaultReasoningEffort: 'medium', inputModalities: ['text'], isDefault: true }] },
+        grok: { enabled: true, visibleModels: ['grok-code-fast-1'] },
+      },
+    },
+    getConversationSummary: id => repository.getSummary(id),
+    getConversationSync: id => repository.getSync(id),
+  });
+  const host = plugin.providerHost;
+  const { app, settings } = plugin;
+  const root = host.workingDirectory!;
+  const adapter = plugin.storage.getAdapter();
+  settings.providerConfigs.claude!.environmentVariables = `CLAUDE_CONFIG_DIR=${path.join(root, 'claude')}`;
+  settings.providerConfigs.grok!.environmentVariables = `GROK_HOME=${path.join(root, 'grok')}`;
+  host.getResolvedProviderCliPath = vi.fn(async providerId => `/bin/${providerId}`);
+  const lifecycleRegistry = host.executionLifecycleRegistry;
+  writeGrokCatalog(settings, { fingerprint: 'test', refreshedAt: 1, defaultModelId: 'grok-code-fast-1', models: [{ rawId: 'grok-code-fast-1', displayName: 'Grok', supportsReasoning: false, reasoningEfforts: [] }] });
+  const repository = new ConversationRepository({
+    providers: ProviderRegistry,
+    providerSettings: ProviderSettingsCoordinator,
+    getSettings: () => settings,
+    getVaultPath: () => root,
+    persistence: new ConversationPersistenceStore(adapter, plugin.storage.installationKey),
+    onConversationDeleted: async () => undefined,
+  });
+  const coordinators: ChatExecutionCoordinator[] = [];
+  let sequence = 0;
+
+  async function open(backend: ProviderExecutionBackend, conversation?: Conversation) {
+    const current = conversation ?? await repository.create({ providerId: backend.providerId });
+    const coordinator = new ChatExecutionCoordinator({
+      lifecycleRegistry,
+      resolveBackend: () => backend,
+      persistence: repository,
+      interactionPort: {
+        askUserQuestion: async () => { throw new Error('Unexpected question'); },
+        requestApproval: async () => { throw new Error('Unexpected approval'); },
+        dismissInteraction: () => undefined,
+      },
+      workingDirectory: root,
+      createId: () => `execution-${++sequence}`,
+      resolveMissingProviderSession: async () => 'preserved',
+    });
+    coordinators.push(coordinator);
+    await coordinator.bindConversation({
+      conversationId: current.id, providerId: current.providerId,
+      resumeSeed: { providerSessionId: current.sessionId ?? undefined, providerState: current.providerState },
+    });
+    return { conversation: current, coordinator };
+  }
+
+  async function send(chat: Awaited<ReturnType<typeof open>>, text: string, expectedStatus = 'completed') {
+    const user: ChatMessage = { id: `user-${++sequence}`, role: 'user', content: text, timestamp: sequence };
+    const assistant: ChatMessage = { id: `assistant-${++sequence}`, role: 'assistant', content: '', timestamp: sequence };
+    const history = [...chat.conversation.messages];
+    chat.conversation.messages.push(user, assistant);
+    const result = await chat.coordinator.execute({
+      submissionId: user.id,
+      timestamp: user.timestamp, rawDisplayText: text, canonicalText: text, images: [],
+      conversationHistory: history, messages: { user, assistant },
+      configuration: { model: { claude: 'claude-sonnet-4-5', codex: 'gpt-5', grok: 'grok/grok-code-fast-1', pi: 'pi:anthropic/claude-sonnet-4', opencode: 'opencode:test/model' }[chat.conversation.providerId], permissionMode: 'normal', systemInstructions: { kind: 'explicit', instructions: 'Answer the user.' } },
+      toolPolicy: { kind: 'provider-default' },
+    }).catch(error => { throw new Error(JSON.stringify(error.cause ?? error), { cause: error }); });
+    if (result.status !== expectedStatus) throw new Error(JSON.stringify(result));
+    await repository.update(chat.conversation.id, { messages: chat.conversation.messages });
+    Object.assign(chat.conversation, repository.getSync(chat.conversation.id)!, { messages: chat.conversation.messages });
+    return assistant;
+  }
+
+  async function fork(chat: Awaited<ReturnType<typeof open>>, message: ChatMessage, pathContext?: ProviderHistoryPathContext) {
+    let child: Conversation | undefined;
+    const tab = {
+      conversationId: chat.conversation.id, providerId: chat.conversation.providerId,
+      executionCoordinator: chat.coordinator,
+      state: { messages: chat.conversation.messages, isStreaming: false, isRewinding: false },
+    } as unknown as AssembledTabRuntime;
+    await handleForkRequest(tab, plugin, message.id, async context => {
+      const providerId = context.providerId as ProviderId;
+      // The fork callback's public provider/repository seams are shared with TabManager.
+      const providerState = await ProviderRegistry.getConversationHistoryService(providerId)
+        .buildForkProviderState(context.sourceSessionId, context.resumeAt, context.sourceProviderState, root, pathContext);
+      child = await repository.create({ providerId });
+      await repository.update(child.id, { messages: context.messages, providerState });
+      child = repository.getSync(child.id)!;
+    }, () => true);
+    return child;
+  }
+
+  return {
+    root, app, adapter, host, plugin, repository, open, send, fork,
+    async dispose() {
+      await Promise.all(coordinators.map(coordinator => coordinator.dispose()));
+      await lifecycleRegistry.dispose();
+    },
+  };
+}
+
+export type ForkTestEnvironment = Awaited<ReturnType<typeof createForkTestEnvironment>>;

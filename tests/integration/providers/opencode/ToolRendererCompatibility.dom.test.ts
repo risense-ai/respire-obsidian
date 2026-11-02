@@ -1,0 +1,228 @@
+// @test-ci {"native":true,"inputs":["tests/helpers/providers/opencode/OpencodeNativePeer.cjs"]}
+/** @vitest-environment jsdom */
+import '@/providers';
+
+import { axe } from '@test/helpers/accessibility';
+import { createChatFeatureHost } from '@test/helpers/features/chat/ChatFeatureHostFixture';
+import { createFixture, turn } from '@test/helpers/providers/opencode/OpencodeSharedServerFixture';
+import { testDate } from '@test/helpers/testClock';
+import { fireEvent, within } from '@testing-library/dom';
+import { Component } from 'obsidian';
+
+import type { ProviderExecutionEvent } from '@/core/execution';
+import { getToolIcon } from '@/core/tools/toolIcons';
+import type { ChatMessage, StreamChunk, ToolCallInfo } from '@/core/types';
+import { MessageRenderer } from '@/features/chat/rendering/MessageRenderer';
+import { providerOutputEventToStreamChunk } from '@/features/chat/rendering/providerOutputChunks';
+import { renderStoredToolCall } from '@/features/chat/rendering/tools/ToolCallRenderer';
+import { renderStoredWriteEdit } from '@/features/chat/rendering/tools/WriteEditRenderer';
+import { ChatState } from '@/features/chat/state/ChatState';
+import { SubagentManager } from '@/features/chat/subagents/SubagentManager';
+import { StreamController } from '@/features/chat/turns/StreamController';
+import { mapOpencodeNativeMessages } from '@/providers/opencode/history/OpencodeHistoryStore';
+
+beforeEach(() => document.body.replaceChildren());
+
+interface NativeToolCall {
+  name: string;
+  input: Record<string, unknown>;
+  content?: string[];
+  metadata?: Record<string, unknown>;
+  error?: { type: string; message: string };
+}
+
+/** Replays one native V2 tool call through the live HTTP kernel and chat stream. */
+async function restoreLiveV2(call: NativeToolCall): Promise<ToolCallInfo> {
+  const fixture = await createFixture();
+  await fixture.workspace.metadataService.loadCatalog();
+  const session = fixture.createSession();
+  const control = await fixture.workspace.serverService.acquire(fixture.cli, fixture.root, fixture.environment);
+  let started!: () => void;
+  const startedPromise = new Promise<void>(resolve => { started = resolve; });
+  const output: ProviderExecutionEvent[] = [];
+  const run = session.execute(turn('hold'));
+  const done = (async () => {
+    for await (const event of run.events) {
+      output.push(event);
+      if (event.type === 'text_delta' && event.text === 'hold') started();
+    }
+  })();
+  try {
+    await Promise.race([startedPromise, done.then(() => { throw new Error('Native turn ended before the held output: ' + JSON.stringify(output)); })]);
+    const sessionID = session.getSnapshot().providerSessionId;
+    const event = (type: string, data: Record<string, unknown> = {}) => control.request('/fixture/event', {
+      method: 'POST', body: { type, data: { sessionID, assistantMessageID: 'msg_main', id: 'tool', ...data } },
+    });
+    await event('session.tool.input.started', { name: call.name });
+    await event('session.tool.called', { input: call.input, executed: true });
+    if (call.error) {
+      await event('session.tool.failed', { error: call.error, metadata: call.metadata, executed: true });
+    } else {
+      await event('session.tool.success', {
+        content: (call.content ?? []).map(text => ({ type: 'text', text })), metadata: call.metadata, executed: true,
+      });
+    }
+    await event('session.execution.succeeded');
+    await done;
+    return await renderLiveEvents(output);
+  } finally {
+    await session.dispose(); await control.dispose(); await fixture.dispose();
+  }
+}
+
+async function renderLiveEvents(output: readonly ProviderExecutionEvent[]): Promise<ToolCallInfo> {
+  const messages = document.body.createDiv();
+  const state = new ChatState();
+  const plugin = await createChatFeatureHost({ settings: { mediaFolder: '', showMessageTimestamps: false } });
+  const renderer = new MessageRenderer(plugin, new Component(), messages);
+  const stream = new StreamController({ plugin, state, renderer,
+    subagentManager: new SubagentManager(() => undefined), getMessagesEl: () => messages, updateQueueIndicator: () => undefined,
+  });
+  const response: ChatMessage = { id: 'response', role: 'assistant', timestamp: testDate().getTime(), content: '', contentBlocks: [] };
+  try {
+    state.addMessage(response);
+    state.currentContentEl = renderer.addMessage(response).querySelector('.claudian-message-content');
+    for (const chunk of output.map(providerOutputEventToStreamChunk)) {
+      if (chunk?.type === 'tool_use' || chunk?.type === 'tool_result') await stream.handleStreamChunk(chunk as StreamChunk, response);
+    }
+    expect(response.toolCalls).toHaveLength(1);
+    return response.toolCalls![0];
+  } finally {
+    stream.dispose();
+    renderer.dispose();
+    messages.remove();
+  }
+}
+
+function restoreV2History(call: NativeToolCall): ToolCallInfo {
+  const state = call.error
+    ? { status: 'error', input: call.input, error: call.error, metadata: call.metadata ?? null, content: null }
+    : { status: 'completed', input: call.input, metadata: call.metadata, content: (call.content ?? []).map(text => ({ type: 'text', text })) };
+  const [message] = mapOpencodeNativeMessages([{
+    id: 'msg', type: 'assistant', time_created: testDate().getTime(),
+    content: [{ type: 'tool', id: 'tool', name: call.name, state }],
+  }]);
+  expect(message.toolCalls).toHaveLength(1);
+  return message.toolCalls![0];
+}
+
+const restore = (mode: 'live' | 'history', call: NativeToolCall) => mode === 'live'
+  ? restoreLiveV2(call)
+  : Promise.resolve(restoreV2History(call));
+
+const expand = (block: HTMLElement, name: RegExp) => {
+  const header = within(block).getByRole('button', { name });
+  fireEvent.keyDown(header, { key: 'Enter' });
+  return header;
+};
+
+const lines = (block: HTMLElement) => [...block.querySelectorAll('.claudian-tool-line')].map(line => line.textContent);
+
+describe.each(['live', 'history'] as const)('%s OpenCode V2 tool presentation', mode => {
+  it('renders code-mode execute as a JavaScript script with its output', async () => {
+    const code = 'return await tools.browser.preview({ path: "DEMO.md" });';
+    const tool = await restore(mode, {
+      name: 'execute', input: { code },
+      content: ['Preview opened'], metadata: { toolCalls: [{ tool: 'browser.preview', status: 'completed' }], truncated: false },
+    });
+    expect(tool.status).toBe('completed');
+    expect(getToolIcon(tool.name)).toBe('code');
+    const block = renderStoredToolCall(document.body.createDiv(), tool);
+    expand(block, /^Script: return await tools\.browser\.preview/);
+    expect(block.querySelector('code')?.textContent).toBe(code);
+    expect(block.querySelector('.claudian-tool-script-output')?.textContent).toBe('Preview opened');
+    expect((await axe(block)).violations).toEqual([]);
+  });
+
+  it('marks code-mode failures reported only through metadata as errors', async () => {
+    const tool = await restore(mode, {
+      name: 'execute', input: { code: 'return await tools.browser.preview({});' },
+      content: ['[browser.disconnected] No desktop browser is connected to this session.'],
+      metadata: { toolCalls: [{ tool: 'browser.preview', status: 'error' }], error: true, truncated: false },
+    });
+    expect(tool.status).toBe('error');
+  });
+
+  it.each([
+    [{ status: 'completed', exit: 0, truncated: false }, 'completed'],
+    [{ status: 'completed', exit: 2, truncated: false }, 'error'],
+    [{ status: 'completed', signal: 'SIGKILL', truncated: false }, 'error'],
+    [{ status: 'completed', timeout: true, truncated: false }, 'error'],
+  ] as const)('derives shell status from native termination metadata %#', async (metadata, status) => {
+    const tool = await restore(mode, { name: 'shell', input: { command: 'make check' }, content: ['output'], metadata });
+    expect(tool).toMatchObject({ name: 'Bash', status });
+  });
+
+  it('builds edit diffs from the native patch, including surrounding context', async () => {
+    const tool = await restore(mode, {
+      name: 'edit',
+      input: { path: 'DEMO.md', oldString: '| Table | Aligned columns |', newString: '| Table | Aligned columns |\n\nRound 3.' },
+      content: ['Edited DEMO.md (1 replacement)'],
+      metadata: { truncated: false, files: [{ file: 'DEMO.md', status: 'modified', additions: 2, deletions: 0, patch: [
+        'Index: DEMO.md', '===================================================================', '--- DEMO.md', '+++ DEMO.md',
+        '@@ -87,4 +87,6 @@', ' | Callout | Colored box with title |', ' | Math block | Centered display equation |',
+        ' | Table | Aligned columns |', ' ', '+Round 3.', '+', '',
+      ].join('\n') }] },
+    });
+    expect(tool.name).toBe('Edit');
+    expect(tool.diffData?.stats).toEqual({ added: 2, removed: 0 });
+    expect(tool.diffData?.diffLines[0]).toEqual({ type: 'equal', text: '| Callout | Colored box with title |', oldLineNum: 87, newLineNum: 87 });
+  });
+
+  it('renders the patch tool as per-file apply_patch diffs', async () => {
+    const tool = await restore(mode, {
+      name: 'patch',
+      input: { patchText: '*** Begin Patch\n*** Update File: notes/plan.md\n@@\n-Draft\n+Final\n*** Add File: notes/new.md\n+Created\n*** End Patch' },
+      content: ['Success. Updated the following files:\nM notes/plan.md\nA notes/new.md'],
+      metadata: { truncated: false, files: [] },
+    });
+    expect(getToolIcon(tool.name)).toBe(getToolIcon('apply_patch'));
+    const block = renderStoredToolCall(document.body.createDiv(), tool);
+    expand(block, /^apply_patch: 2 files/);
+    expect([...block.querySelectorAll('.claudian-diff-insert .claudian-diff-text')].map(line => line.textContent))
+      .toEqual(expect.arrayContaining(['Final', 'Created']));
+  });
+
+  it.each([
+    ['Alpha', '12: literal colon', ' '],
+    ['1→Alpha', '2→literal arrow', ' '],
+  ])('shows read output without altering file text: %j', async (...fileLines) => {
+    const tool = await restore(mode, {
+      name: 'read', input: { path: 'DEMO.md', offset: 70 },
+      content: [`Read file DEMO.md, lines 70-72\n${fileLines.map((line, index) => `${70 + index}: ${line}`).join('\n')}`],
+      metadata: { truncated: false },
+    });
+    const block = renderStoredToolCall(document.body.createDiv(), tool);
+    expand(block, /^Read: DEMO\.md/);
+    expect(lines(block)).toEqual(fileLines);
+  });
+
+  it('renders web search hits as linked titles without their date or snippet', async () => {
+    const published = testDate().toISOString();
+    const tool = await restore(mode, {
+      name: 'websearch', input: { query: 'AAPL price' },
+      content: [`## [Stock Price](https://investor.apple.com/stock-price/)\nPublished: ${published}\nQuote snippet\n\n## [AAPL Quote](https://finance.example.com/AAPL)\nSecond snippet`],
+      metadata: { provider: 'tinyfish', truncated: false },
+    });
+    const block = renderStoredToolCall(document.body.createDiv(), tool);
+    expand(block, /AAPL price/);
+    expect(within(block).getByRole('link', { name: 'Stock Price' }).getAttribute('href')).toBe('https://investor.apple.com/stock-price/');
+    expect(within(block).getByRole('link', { name: 'AAPL Quote' }).getAttribute('href')).toBe('https://finance.example.com/AAPL');
+    expect(block.textContent).not.toContain(published);
+    expect(block.textContent).not.toMatch(/Quote snippet|Second snippet/);
+    expect((await axe(block)).violations).toEqual([]);
+  });
+});
+
+it.each([
+  { oldString: 'obsolete', newString: '', removed: ['obsolete'], added: [] },
+  { oldString: '', newString: 'created', removed: [], added: ['created'] },
+])('restores edit diffs with an empty side: %j', ({ oldString, newString, removed, added }) => {
+  const tool = restoreV2History({
+    name: 'edit', input: { path: 'notes.md', oldString, newString }, content: ['Edited notes.md (1 replacement)'],
+  });
+  const block = renderStoredWriteEdit(document.body.createDiv(), tool, { initiallyExpanded: true });
+  expect(within(block).getByRole('button', { name: /Edit: notes.md/ })).toBeDefined();
+  expect([...block.querySelectorAll('.claudian-diff-delete .claudian-diff-text')].map(line => line.textContent)).toEqual(removed);
+  expect([...block.querySelectorAll('.claudian-diff-insert .claudian-diff-text')].map(line => line.textContent)).toEqual(added);
+});

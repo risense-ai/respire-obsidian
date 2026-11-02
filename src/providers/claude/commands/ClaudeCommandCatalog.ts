@@ -1,0 +1,186 @@
+import { isSkill } from '@/core/commands/slashCommand';
+
+import type {
+  ProviderCommandCatalog,
+  ProviderCommandDropdownConfig,
+  ProviderCommandListContext,
+} from '../../../core/providers/commands/ProviderCommandCatalog';
+import type { ProviderCommandEntry } from '../../../core/providers/commands/ProviderCommandEntry';
+import type { SlashCommand } from '../../../core/types';
+
+function slashCommandToEntry(cmd: SlashCommand): ProviderCommandEntry {
+  const skill = isSkill(cmd);
+  // Claude Code owns every command it reports; only Claudian-authored vault commands are editable.
+  const native = cmd.source === 'sdk' || cmd.source === 'builtin';
+  return {
+    id: cmd.id,
+    providerId: 'claude',
+    kind: skill ? 'skill' : 'command',
+    name: cmd.name,
+    description: cmd.description,
+    content: cmd.content,
+    argumentHint: cmd.argumentHint,
+    allowedTools: cmd.allowedTools,
+    model: cmd.model,
+    disableModelInvocation: cmd.disableModelInvocation,
+    userInvocable: cmd.userInvocable,
+    context: cmd.context,
+    agent: cmd.agent,
+    hooks: cmd.hooks,
+    scope: cmd.source === 'builtin' ? 'builtin' : native ? 'runtime' : 'vault',
+    source: cmd.source ?? 'user',
+    isEditable: !native,
+    isDeletable: !native,
+    displayPrefix: '/',
+    insertPrefix: '/',
+  };
+}
+
+// A cold CLI start plus capped MCP startup can exceed the shared picker deadline.
+const CLAUDE_COMMAND_DISCOVERY_TIMEOUT_MS = 30_000;
+
+export type CommandProbe = (signal?: AbortSignal) => Promise<SlashCommand[]>;
+
+interface ActiveCommandProbe {
+  readonly completion: Promise<void>;
+  readonly controller: AbortController;
+  resolveCompletion(): void;
+}
+
+export class ClaudeCommandCatalog implements ProviderCommandCatalog {
+  private readonly activeProbes = new Set<ActiveCommandProbe>();
+  private disposed = false;
+  private disposePromise: Promise<void> | null = null;
+  private quiescenceDepth = 0;
+  private probedCommands: SlashCommand[] | null = null;
+  private probePromise: Promise<SlashCommand[]> | null = null;
+  private transitionActive = false;
+
+  constructor(private probe?: CommandProbe) {}
+
+  async listDropdownEntries(context: ProviderCommandListContext): Promise<ProviderCommandEntry[]> {
+    context.signal?.throwIfAborted();
+    // SDK commands already include vault commands/skills (the SDK scans
+    // .claude/commands/ and .claude/skills/ internally). No file scan needed.
+    const commands = context.commandSnapshot ?? await this.#ensureProbed(context.signal);
+    // Claude Code's own commands mostly target its terminal UI, so the picker offers only skills and
+    // custom commands. A marked row runs for its name, so it also hides an unmarked row sharing that name.
+    // Snapshots from CLIs that do not mark built-ins cannot be classified and are kept whole.
+    const nativeNames = new Set(commands
+      .filter(cmd => cmd.source === 'builtin')
+      .map(cmd => cmd.name.toLowerCase()));
+    return commands
+      .filter(cmd => !nativeNames.has(cmd.name.toLowerCase()))
+      .map(slashCommandToEntry);
+  }
+
+  /** Probe the SDK for commands. Deduplicates concurrent calls. */
+  async #ensureProbed(signal?: AbortSignal): Promise<SlashCommand[]> {
+    signal?.throwIfAborted();
+    if (this.probesBlocked) return [];
+    if (this.probedCommands) return this.probedCommands;
+    if (!this.probe) return [];
+    if (signal) {
+      return await this.#runProbe(signal);
+    }
+    if (!this.probePromise) {
+      const probePromise = this.#runProbe().finally(() => {
+        if (this.probePromise === probePromise) {
+          this.probePromise = null;
+        }
+      });
+      this.probePromise = probePromise;
+    }
+    return await this.probePromise;
+  }
+
+  async #runProbe(signal?: AbortSignal): Promise<SlashCommand[]> {
+    let resolveCompletion!: () => void;
+    const entry: ActiveCommandProbe = {
+      completion: new Promise(resolve => { resolveCompletion = resolve; }),
+      controller: new AbortController(),
+      resolveCompletion: () => resolveCompletion(),
+    };
+    const onAbort = (): void => entry.controller.abort(signal?.reason);
+    signal?.addEventListener('abort', onAbort, { once: true });
+    if (signal?.aborted) onAbort();
+    this.activeProbes.add(entry);
+    try {
+      entry.controller.signal.throwIfAborted();
+      const commands = await this.probe?.(entry.controller.signal) ?? [];
+      entry.controller.signal.throwIfAborted();
+      this.probedCommands = commands.map(command => ({ ...command }));
+      return this.probedCommands;
+    } catch (error) {
+      signal?.throwIfAborted();
+      if (entry.controller.signal.aborted) return [];
+      // Failures stay uncached so a retry re-probes.
+      throw error;
+    } finally {
+      signal?.removeEventListener('abort', onAbort);
+      this.activeProbes.delete(entry);
+      entry.resolveCompletion();
+    }
+  }
+
+  getDropdownConfig(): ProviderCommandDropdownConfig {
+    return {
+      providerId: 'claude',
+      triggerChars: ['/'],
+      builtInPrefix: '/',
+      skillPrefix: '/',
+      commandPrefix: '/',
+      discoveryTimeoutMs: CLAUDE_COMMAND_DISCOVERY_TIMEOUT_MS,
+    };
+  }
+
+  async refresh(): Promise<void> {
+    await this.quiesceForEnvironmentChange();
+  }
+
+  async quiesceForEnvironmentChange(): Promise<void> {
+    this.quiescenceDepth += 1;
+    try {
+      await this.#drainProbes();
+    } finally {
+      this.quiescenceDepth -= 1;
+    }
+  }
+
+  async beginEnvironmentTransition(): Promise<void> {
+    this.transitionActive = true;
+    await this.#drainProbes();
+  }
+
+  endEnvironmentTransition(): void {
+    this.transitionActive = false;
+  }
+
+  async #drainProbes(): Promise<void> {
+    const sharedProbe = this.probePromise;
+    this.#invalidateProbeCache();
+    const active = [...this.activeProbes];
+    await Promise.all([
+      ...active.map(entry => entry.completion),
+      ...(sharedProbe ? [sharedProbe.then(() => undefined)] : []),
+    ]);
+  }
+
+  dispose(): Promise<void> {
+    if (this.disposePromise) return this.disposePromise;
+    this.disposed = true;
+    this.disposePromise = this.quiesceForEnvironmentChange();
+    return this.disposePromise;
+  }
+
+  #invalidateProbeCache(): void {
+    this.probedCommands = null;
+    for (const entry of this.activeProbes) {
+      entry.controller.abort();
+    }
+  }
+
+  private get probesBlocked(): boolean {
+    return this.disposed || this.transitionActive || this.quiescenceDepth > 0;
+  }
+}

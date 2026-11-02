@@ -1,0 +1,145 @@
+import type { ProviderCLIResolver } from '@/core/providers/types';
+import { PI_PROVIDER_ICON } from '@/shared/icons';
+import { AccessibleSetting } from '@/shared/settings/AccessibleSetting';
+import { renderCLIInstallationSetting } from '@/shared/settings/CLIInstallationSetting';
+import { renderExecutionTargetSettings, validateExecutionTargetCLIPath } from '@/shared/settings/ExecutionTargetSettings';
+
+import type { ProviderModelCatalog } from '../../../core/providers/models/ProviderModelCatalog';
+import { ProviderSettingsCoordinator } from '../../../core/providers/ProviderSettingsCoordinator';
+import type {
+  ProviderSettingsTabRenderer
+} from '../../../core/providers/types';
+import { t } from '../../../i18n/i18n';
+import { renderEnvironmentSettingsSection } from '../../../shared/settings/EnvironmentSettingsSection';
+import type { ProviderEnablementSettingOptions } from '../../../shared/settings/ProviderEnablementSetting';
+import {
+  renderLastEnabledProviderWarning,
+  renderProviderModelEnablementWarning,
+} from '../../../shared/settings/ProviderModelEnablementWarning';
+import { renderProviderModelsSection } from '../../../shared/settings/ProviderModelsSection';
+import { inspectPiInstallation } from '../runtime/PiCLIInstallation';
+import {
+  getPiProviderSettings,
+  updatePiProviderSettings
+} from '../settings';
+
+export function createPiSettingsTabRenderer(
+  workspace: { cliResolver: Pick<ProviderCLIResolver, 'reset'>; modelCatalog: ProviderModelCatalog; },
+): ProviderSettingsTabRenderer {
+  return {
+    render(container, context) {
+      const settingsBag = context.plugin.settings as unknown as Record<string, unknown>;
+      const hostnameKey = context.plugin.storage.installationKey;
+
+      const enablement: Omit<ProviderEnablementSettingOptions, 'container' | 'description'> = {
+        getValue: () => getPiProviderSettings(settingsBag).enabled,
+        name: t('settings.providerEnablement.name', { provider: 'Pi' }),
+        onChange: async (value) => {
+          if (!ProviderSettingsCoordinator.canApplyProviderEnablement(
+            settingsBag,
+            'pi',
+            value,
+          )) {
+            lastProviderWarning.showFor();
+            return;
+          }
+
+          let accepted = true;
+          await context.plugin.runProviderExecutionTransition(['pi'], async () => {
+            await context.plugin.mutateSettings((settings) => {
+              accepted = ProviderSettingsCoordinator.applyProviderEnablement(
+                settings,
+                'pi',
+                value,
+              );
+            });
+          });
+          if (accepted) {
+            lastProviderWarning.hide();
+          } else {
+            lastProviderWarning.showFor();
+          }
+          modelWarning.context.notifyProviderModelOptionsChanged('pi');
+        },
+      };
+
+      const installationContainer = container.createDiv();
+      const lastProviderWarning = renderLastEnabledProviderWarning(container);
+
+      const modelWarning = renderProviderModelEnablementWarning(container, context, {
+        getHasEnabledModels: () => getPiProviderSettings(settingsBag).visibleModels.length > 0,
+        getIsEnabled: () => getPiProviderSettings(settingsBag).enabled,
+        providerId: 'pi',
+        providerName: 'Pi',
+      });
+
+      const getCLIPlaceholder = () => process.platform === 'win32'
+        ? getPiProviderSettings(settingsBag).installationMethod === 'wsl' ? 'pi' : 'C:\\Users\\you\\AppData\\Roaming\\npm\\pi.cmd'
+        : '/usr/local/bin/pi';
+      const installation = renderCLIInstallationSetting({
+        cliName: 'Pi',
+        icon: PI_PROVIDER_ICON,
+        inspect: () => inspectPiInstallation(context.plugin.getRuntimeHost('pi')),
+        container: installationContainer,
+        enablement,
+        getValue: () => {
+          const config = getPiProviderSettings(settingsBag);
+          return config.cliPathsByHost[hostnameKey] || config.cliPath;
+        },
+        name: t('settings.cliPath.genericName'),
+        onChange: async (value) => {
+          const cliPathsByHost = {
+            ...getPiProviderSettings(settingsBag).cliPathsByHost,
+          };
+          if (value) {
+            cliPathsByHost[hostnameKey] = value;
+          } else {
+            delete cliPathsByHost[hostnameKey];
+          }
+
+          await context.plugin.applyProviderRuntimeSettings(
+            ['pi'],
+            (settings) => {
+              updatePiProviderSettings(settings, {
+                cliPathsByHost,
+              });
+            },
+            () => workspace?.cliResolver?.reset(),
+          );
+          context.notifyProviderModelOptionsChanged('pi');
+        },
+        placeholder: getCLIPlaceholder(),
+        validate: value => validateExecutionTargetCLIPath(value, getPiProviderSettings(settingsBag)),
+      });
+
+      renderExecutionTargetSettings({
+        container, providerName: 'Pi', getValue: () => getPiProviderSettings(settingsBag),
+        onChange: async updates => {
+          await context.plugin.applyProviderRuntimeSettings(['pi'], settings => {
+            updatePiProviderSettings(settings, updates);
+          }, () => workspace.cliResolver.reset());
+          context.notifyProviderModelOptionsChanged('pi');
+        },
+        onRefresh: () => {
+          installation.setPlaceholder(getCLIPlaceholder());
+          installation.revalidate();
+          void installation.refresh();
+        },
+      });
+
+      new AccessibleSetting(container).setName('Models').setDesc(t('settings.pi.models.desc')).setHeading();
+      const modelPicker = renderProviderModelsSection(container, 'pi', 'Pi', workspace.modelCatalog, () => modelWarning.refresh());
+
+      renderEnvironmentSettingsSection({
+        container,
+        desc: t('settings.pi.environment.desc'),
+        heading: t('settings.environment'),
+        name: t('settings.pi.environment.name'),
+        placeholder: 'PI_CODING_AGENT_SESSION_DIR=/path/to/sessions',
+        plugin: context.plugin,
+        scope: 'provider:pi',
+      });
+      return modelPicker;
+    },
+  };
+}

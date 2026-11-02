@@ -1,0 +1,219 @@
+
+export interface ApprovalSelectionDecision {
+  type: 'select-option';
+  value: string;
+}
+
+/** User decision from the approval modal. */
+export type ApprovalDecision =
+  | 'allow'
+  | 'allow-always'
+  | 'deny'
+  | 'cancel'
+  | ApprovalSelectionDecision;
+
+/** Saved environment variable configuration. */
+export interface EnvSnippet {
+  id: string;
+  name: string;
+  description: string;
+  envVars: string;
+  scope?: EnvironmentScope;
+  contextLimits?: Record<string, number>;  // Optional: context limits for custom models
+  modelAliases?: Record<string, string>;   // Optional: display aliases for custom models
+}
+
+/** Source of a slash command. */
+export type SlashCommandSource = 'builtin' | 'user' | 'plugin' | 'sdk';
+
+/** Slash command configuration shared by the UI, storage, and runtime boundary. */
+export interface SlashCommand {
+  id: string;
+  name: string;                // Command name used after / (e.g., "review-code")
+  description?: string;        // Optional description shown in dropdown
+  argumentHint?: string;       // Placeholder text for arguments (e.g., "[file] [focus]")
+  allowedTools?: string[];     // Restrict tools when command is used
+  model?: string;              // Optional provider-specific model override
+  content: string;             // Prompt template with placeholders
+  source?: SlashCommandSource; // Origin of the command (builtin, user, plugin, sdk)
+  kind?: 'command' | 'skill';  // Explicit type — replaces id-prefix heuristic
+  // Provider-owned command metadata that the UI preserves and round-trips.
+  disableModelInvocation?: boolean;  // Disable model invocation for this skill
+  userInvocable?: boolean;           // Whether user can invoke this skill directly
+  context?: 'fork';                  // Subagent execution mode
+  agent?: string;                    // Subagent type when context='fork'
+  hooks?: Record<string, unknown>;   // Pass-through to SDK
+}
+
+/** Keyboard navigation settings for vim-style scrolling. */
+export interface KeyboardNavigationSettings {
+  scrollUpKey: string;         // Key to scroll up when focused on messages (default: 'w')
+  scrollDownKey: string;       // Key to scroll down when focused on messages (default: 's')
+  focusInputKey: string;       // Key to focus input (default: 'i', like vim insert mode)
+}
+
+/** rsrs importance tier used for automatic writes and imports. */
+export type RsrsImportance = 'trivial' | 'important';
+
+/** Cross-session memory powered by the local rsrs CLI. */
+export interface RsrsMemorySettings {
+  enabled: boolean;
+  /** Empty resolves the local install (RSRS_BIN, ~/.rsrs/bin, then PATH). */
+  binaryPath: string;
+  recallLimit: number;
+  recallTimeoutMs: number;
+  maxRecallChars: number;
+  autoRemember: boolean;
+  rememberImportance: RsrsImportance;
+  project: string;
+  /** rsrs extract source id, or `all` to scan every installed agent store. */
+  extractSource: string;
+  extractSince: string;
+  extractLimit: number;
+  extractImportance: RsrsImportance;
+  /** Restrict extraction to sessions whose working directory contains the Vault path. */
+  extractCwdToVault: boolean;
+}
+
+export const CHAT_VIEW_PLACEMENTS = [
+  'right-sidebar',
+  'left-sidebar',
+  'main-tab',
+] as const;
+
+/** Workspace location used when opening the Claudian chat view. */
+export type ChatViewPlacement = typeof CHAT_VIEW_PLACEMENTS[number];
+
+export const DUAL_PANE_SIDES = ['left', 'right'] as const;
+
+/** Side of the chat occupied by the session manager in dual-pane mode. */
+export type DualPaneSide = typeof DUAL_PANE_SIDES[number];
+
+/**
+ * Where the user left the floating zen panel: its bottom-center offset from the docked
+ * spot, as fractions of the central workspace width and height (y grows upward).
+ */
+export interface ZenModePosition {
+  readonly x: number;
+  readonly y: number;
+}
+
+export type SessionManagerOrganization = 'list' | 'linked-content';
+export type SessionManagerSort = 'last-updated' | 'created';
+export type SessionAutoArchiveAfter = 'off' | '7d' | '14d' | '30d';
+
+/** Scope for environment variable storage and snippets. */
+export type EnvironmentScope = 'shared' | `provider:${string}`;
+
+/** Opaque device-keyed CLI paths for per-device configuration. */
+export type HostnameCLIPaths = Record<string, string>;
+
+/** Opaque provider-owned settings bags keyed by provider id. */
+export type ProviderConfigMap = Partial<Record<string, Record<string, unknown>>>;
+
+/** Provider-qualified model explicitly selected in chat and used to seed future tabs. */
+export interface StoredChatModelSelection {
+  providerId: string;
+  model: string;
+}
+
+/** Inline edit's own model; reasoning is omitted to follow the provider's saved effort. */
+export interface StoredInlineEditModelSelection extends StoredChatModelSelection {
+  reasoning?: string;
+}
+
+/**
+ * Application settings stored in .claudian/claudian-settings.json.
+ *
+ * Provider-specific fields (model, effortLevel, serviceTier, etc.) use
+ * `string` here.  The active provider casts internally when it needs
+ * narrower types.
+ */
+export interface ClaudianSettings {
+  // User preferences
+  userName: string;
+
+  // Security (provider interprets values)
+  permissionMode: string;
+
+  // Model & thinking (provider interprets values)
+  model: string;
+  effortLevel: string;
+  serviceTier: string;
+  enableAutoTitleGeneration: boolean;
+  titleGenerationLocale: string;
+  titleGenerationModel: string;
+
+  // Content settings
+  excludedTags: string[];
+  mediaFolder: string;
+  systemPrompt: string;
+
+  // Cross-session memory (rsrs CLI)
+  rsrsMemory: RsrsMemorySettings;
+
+  // Environment
+  sharedEnvironmentVariables: string;
+  envSnippets: EnvSnippet[];
+  customContextLimits: Record<string, number>;
+
+  // UI settings
+  keyboardNavigation: KeyboardNavigationSettings;
+  requireCommandOrControlEnterToSend: boolean;
+
+  // Internationalization
+  locale: string;
+
+  // Provider-owned settings
+  providerConfigs: ProviderConfigMap;
+
+  // Provider selection
+  settingsProvider: string;  // ProviderId — which provider's model/effort is projected to top-level fields
+  lastSelectedChatModel: StoredChatModelSelection | null;
+  /** Null starts inline edits from the active chat selection. */
+  inlineEditModel: StoredInlineEditModelSelection | null;
+  savedProviderModel: Partial<Record<string, string>>;
+  savedProviderEffort: Partial<Record<string, string>>;
+  savedProviderServiceTier: Partial<Record<string, string>>;
+  savedProviderPermissionMode: Partial<Record<string, string>>;
+
+  // Internal lifecycle state. Entries remain until all affected session metadata is durable.
+  pendingProviderSessionInvalidations: Partial<Record<string, number>>;
+
+  // UI preferences
+  enableAutoScroll: boolean;
+  showMessageTimestamps?: boolean;
+  deferMathRenderingDuringStreaming: boolean;
+  /** Fence languages dispatched to registered plugin code block processors in chat. */
+  pluginRenderedFenceLanguages: string[];
+  expandFileEditsByDefault: boolean;
+  chatViewPlacement: ChatViewPlacement;
+  enableZenMode: boolean;
+  /** Null keeps the zen panel docked. */
+  zenModePosition: ZenModePosition | null;
+  enableDualPane: boolean;
+  dualPaneSide: DualPaneSide;
+  restoreTabsOnStartup: boolean;
+  /**
+   * Vault-wide record that Sync unified Claude skills into `.agents/skills`. The
+   * `.claude/skills` link itself is per device and always read from disk.
+   */
+  skillsSynced: boolean;
+  sessionManagerOrganization?: SessionManagerOrganization;
+  sessionManagerSort?: SessionManagerSort;
+  /**
+   * Project ids in the user's dragged order; pinned projects still come first. Projects missing from it lead,
+   * newest first.
+   */
+  projectOrder?: string[];
+  /** Project folders expanded in the session sidebar and compact history. */
+  expandedProjectIds?: string[];
+  pinnedLinkedContentPaths?: string[];
+  sessionAutoArchiveAfter?: SessionAutoArchiveAfter;
+
+  // Provider command visibility
+  hiddenCommands: string[];
+
+  // Allow provider-specific extension fields
+  [key: string]: unknown;
+}

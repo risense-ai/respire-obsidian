@@ -1,0 +1,373 @@
+/** @vitest-environment jsdom */
+import '@/providers';
+
+import * as sdkModule from '@anthropic-ai/claude-agent-sdk';
+import { claudeCatalogFixture } from '@test/helpers/claudeModels';
+import { createChatFeatureHost } from '@test/helpers/features/chat/ChatFeatureHostFixture';
+import { createProjectsFake } from '@test/helpers/features/chat/ProjectsFake';
+import { createSessionRuntimePool } from '@test/helpers/features/chat/SessionRuntimePoolHarness';
+import { FakeSideBackend } from '@test/helpers/features/chat/SideChatSessionHarness';
+import { testDate } from '@test/helpers/testClock';
+import { fireEvent, waitFor, within } from '@testing-library/dom';
+import { App, Component } from 'obsidian';
+
+import { ProviderRegistry } from '@/core/providers/ProviderRegistry';
+import type { ClaudianSettings, Conversation } from '@/core/types';
+import { SessionMessagingService } from '@/features/chat/session-messaging/SessionMessagingService';
+import { activateTab, deactivateTab, destroyTab } from '@/features/chat/tabs/TabLifecycle';
+import { createTabRuntime } from '@/features/chat/tabs/TabRuntimeFactory';
+import { VaultMentionDataProvider } from '@/shared/mention/VaultMentionDataProvider';
+
+const sdkMock = sdkModule as unknown as {
+  resetMockMessages(): void;
+  setMockMessages(messages: unknown[], options?: { appendResult?: boolean }): void;
+  getLastOptions(): sdkModule.Options;
+};
+
+beforeEach(() => {
+  sdkMock.resetMockMessages();
+
+});
+afterEach(() => {
+  vi.restoreAllMocks();
+  document.body.replaceChildren();
+});
+
+async function createView(fakeBackend?: FakeSideBackend) {
+  if (fakeBackend) vi.spyOn(ProviderRegistry, 'createExecutionBackend').mockReturnValue(fakeBackend);
+  const app = new App();
+  Object.assign(app.vault.adapter, { basePath: '/vault' });
+  Object.assign(app.workspace, { getActiveViewOfType: () => null });
+  const settings: Partial<ClaudianSettings> = {
+    model: 'claude-sonnet-4-5', effortLevel: 'high', permissionMode: 'normal',
+    enableAutoTitleGeneration: false, excludedTags: [], mediaFolder: '', systemPrompt: '', userName: '',
+    providerConfigs: { claude: {
+      ...claudeCatalogFixture(['claude-sonnet-4-5', 'claude-opus-4-6'], ['low', 'high']),
+      promptSuggestions: true,
+    } },
+  };
+  const conversation: Conversation = {
+    id: 'conversation-1', providerId: 'claude', selectedModel: 'claude-sonnet-4-5',
+    sessionId: 'main-session', messages: [], title: 'Main session', createdAt: testDate().getTime(), lastActivityAt: testDate().getTime(),
+  };
+  const conversations = new Map([[conversation.id, conversation]]);
+  const saved: unknown[] = [];
+  const pool = createSessionRuntimePool(() => plugin);
+  const messaging = new SessionMessagingService({ getHost: () => plugin, getActiveConversationId: () => conversation.id, refreshModelControls: () => undefined });
+  onTestFinished(() => messaging.dispose());
+  const plugin = await createChatFeatureHost({
+    app, settings, sessionRuntimes: pool,
+    bindSessionTools: id => messaging.bindSessionTools(id),
+    executionPersistence: {
+      registerExecutionBinding() {}, releaseExecutionBinding() {},
+      assertConversationExecutionAuthority: async () => {},
+      persistExecutionSnapshot: async (...args: unknown[]) => { saved.push(args); return true; },
+      recordConversationActivity: async () => {},
+    },
+    getConversationSummary: (id: string) => conversations.get(id) ?? null,
+    projects: createProjectsFake(),
+    getConversationSync: (id: string) => conversations.get(id) ?? null,
+    getConversationById: async (id: string) => conversations.get(id) ?? null,
+    getConversationList: () => [...conversations.values()].map(value => ({ ...value, messageCount: value.messages.length, preview: '' })),
+    renameConversation: async () => {},
+    updateConversation: async (_id: string, patch: unknown) => { saved.push(structuredClone(patch)); },
+    chatModelSelection: { beginIntent: () => 1, commitIntent: async () => true },
+  });
+  vi.spyOn(plugin.providerHost, 'getResolvedProviderCliPath').mockResolvedValue('/bin/claude');
+  let tab = await createTabRuntime({
+    plugin, conversation, component: new Component(),
+    containerEl: document.body.createDiv(),
+    mentionDataProvider: new VaultMentionDataProvider(plugin.app),
+    getProviderCatalogConfig: () => null, isRuntimeLive: () => true,
+    openConversation: async () => {}, startNewConversation: async () => {},
+  });
+  tab.hydrationState = 'ready';
+  await tab.executionCoordinator.bindConversation({ conversationId: conversation.id, providerId: 'claude' });
+  await tab.executionCoordinator.prepare();
+  vi.spyOn(tab.dom.messagesEl, 'getClientRects').mockImplementation(() => (tab.dom.contentEl.hasClass('claudian-hidden') ? [] : [{}]) as unknown as DOMRectList);
+  activateTab(tab);
+  tab.dom.inputEl.focus();
+  return { get tab() { return tab; }, conversation, saved, plugin,
+    rebind: async (providerId: string) => {
+      const next = { ...conversation, id: 'next-conversation', providerId, messages: [],
+        selectedModel: providerId === 'claude' ? conversation.selectedModel : 'gpt-5.5' } as Conversation;
+      conversations.set(next.id, next);
+      const tabId = tab.id;
+      await destroyTab(tab);
+      tab = await createTabRuntime({
+        plugin, conversation: next, component: new Component(), tabId,
+        containerEl: document.body.createDiv(), mentionDataProvider: new VaultMentionDataProvider(plugin.app),
+        getProviderCatalogConfig: () => null, isRuntimeLive: () => true,
+        openConversation: async () => {}, startNewConversation: async () => {},
+      });
+      vi.spyOn(tab.dom.messagesEl, 'getClientRects').mockReturnValue([{}] as unknown as DOMRectList);
+      activateTab(tab);
+    },
+    dispose: async () => { await destroyTab(tab); await plugin.providerHost.executionLifecycleRegistry.dispose(); },
+  };
+}
+
+type View = Awaited<ReturnType<typeof createView>>;
+
+async function finishFakeTurn(view: View, backend: FakeSideBackend) {
+  view.tab.dom.inputEl.value = 'Do the work';
+  const pending = view.tab.controllers.inputController.sendMessage();
+  await waitFor(() => expect(backend.latest.requests).toHaveLength(1));
+  const turnId = backend.latest.activeTurnId;
+  backend.latest.emitText('Done.');
+  backend.latest.complete();
+  await pending;
+  return turnId;
+}
+
+/** The open picker also hides the ghost, so callers observe the composer after it closes. */
+async function selectToolbarModel(view: View, name: RegExp): Promise<HTMLElement> {
+  const modelButton = within(view.tab.dom.inputWrapper).getByRole('button', { name: /Model: / });
+  fireEvent.click(modelButton);
+  fireEvent.click(within(view.tab.dom.inputWrapper).getByRole('option', { name }));
+  fireEvent.keyDown(modelButton, { key: 'Escape' });
+  await waitFor(() => expect(modelButton.getAttribute('aria-expanded')).toBe('false'));
+  return modelButton;
+}
+
+async function finishSideChatTurn(view: View, backend: FakeSideBackend): Promise<void> {
+  const mainSession = backend.latest;
+  view.tab.dom.inputEl.value = '/side Explore elsewhere';
+  const pending = view.tab.controllers.inputController.sendMessage();
+  await waitFor(() => expect(backend.latest).not.toBe(mainSession));
+  await waitFor(() => expect(backend.latest.requests).toHaveLength(1));
+  backend.latest.emitText('Side answer');
+  backend.latest.complete();
+  await pending;
+}
+
+async function selectSideChatModel(view: View, name: RegExp): Promise<void> {
+  const modelButton = await selectToolbarModel(view, name);
+  await waitFor(() => expect(modelButton.getAttribute('aria-label')).toMatch(name));
+  expect(view.saved).not.toContainEqual({ selectedModel: expect.anything() });
+}
+
+function returnToMainComposer(view: View): void {
+  view.tab.controllers.sideChatController.collapse();
+  expect(view.tab.controllers.sideChatController.destination).toBe('main');
+}
+
+/** Composer activity that neither starts a main turn nor changes the main tab's model. */
+const retainingActivity = {
+  'rewind in progress': async (view: View) => {
+    vi.spyOn(view.tab.state, 'isRewinding', 'get').mockReturnValue(true);
+    view.tab.dom.inputEl.value = 'Retry later';
+    await view.tab.controllers.inputController.sendMessage();
+    vi.spyOn(view.tab.state, 'isRewinding', 'get').mockReturnValue(false);
+    expect(view.tab.dom.inputEl.value).toBe('Retry later');
+  },
+  'rejected side command': async (view: View) => {
+    view.tab.dom.inputEl.value = '/side';
+    await view.tab.controllers.inputController.sendMessage();
+    expect(view.tab.dom.inputEl.value).toBe('/side');
+  },
+  'side chat turn': async (view: View, backend: FakeSideBackend) => {
+    await finishSideChatTurn(view, backend);
+    returnToMainComposer(view);
+  },
+  'side chat model change': async (view: View, backend: FakeSideBackend) => {
+    await finishSideChatTurn(view, backend);
+    await selectSideChatModel(view, /opus/i);
+    returnToMainComposer(view);
+  },
+};
+
+it('routes a native post-result suggestion to the composer without persisting it', async () => {
+  const view = await createView();
+  try {
+    sdkMock.setMockMessages([
+      { type: 'system', subtype: 'init', session_id: 'main-session' },
+      { type: 'assistant', message: { content: [{ type: 'text', text: 'Done.' }] } },
+      { type: 'result', subtype: 'success', session_id: 'main-session' },
+      { type: 'prompt_suggestion', suggestion: 'Add tests next', session_id: 'main-session', uuid: 'suggestion' },
+    ], { appendResult: false });
+    view.tab.dom.inputEl.value = 'Do the work';
+    await view.tab.controllers.inputController.sendMessage();
+    await waitFor(() => expect(within(view.tab.dom.inputEl).getByText('Add tests next')).toBeDefined());
+    expect(sdkMock.getLastOptions().promptSuggestions).toBe(true);
+    expect(view.tab.dom.inputEl.value).toBe('');
+    expect(JSON.stringify(view.saved)).not.toContain('Add tests next');
+    expect(JSON.stringify(view.tab.state.messages)).not.toContain('Add tests next');
+    const send = vi.spyOn(view.tab.controllers.inputController, 'sendMessage');
+    fireEvent.keyDown(within(view.tab.dom.inputEl).getByRole('textbox'), { key: 'Tab' });
+    expect(view.tab.dom.inputEl.value).toBe('Add tests next');
+    expect(send).not.toHaveBeenCalled();
+  } finally { await view.dispose(); }
+});
+
+it.each(['tab', 'conversation', 'provider', 'model', 'send'] as const)(
+  'discards a suggestion after a %s change, including delayed delivery', async change => {
+    const backend = new FakeSideBackend();
+    const view = await createView(backend);
+    try {
+      const turnId = await finishFakeTurn(view, backend);
+      const deliver = () => backend.latest.emitSessionEvent({
+        type: 'prompt_suggestion', originatingTurnId: turnId, suggestion: 'Old suggestion',
+      });
+      deliver();
+      expect(within(view.tab.dom.inputEl).getByText('Old suggestion')).toBeDefined();
+      // Existing drafts hide the prediction; clearing after invalidation must not revive it.
+      view.tab.dom.inputEl.value = 'A draft';
+      fireEvent.input(view.tab.dom.inputEl);
+      if (change === 'tab') {
+        deactivateTab(view.tab); activateTab(view.tab);
+      } else if (change === 'conversation' || change === 'provider') {
+        await view.rebind(change === 'provider' ? 'codex' : 'claude');
+      } else if (change === 'model') {
+        await selectToolbarModel(view, /opus/i);
+      } else {
+        const pending = view.tab.controllers.inputController.sendMessage();
+        await waitFor(() => { if (backend.latest.requests.length !== 2) throw new Error('Next turn has not started'); });
+        backend.latest.emitText('Next answer'); backend.latest.complete();
+        await pending;
+      }
+      deliver();
+      view.tab.dom.inputEl.value = '';
+      fireEvent.input(view.tab.dom.inputEl);
+      expect(within(view.tab.dom.inputEl).queryByText('Old suggestion')).toBeNull();
+      expect(within(view.tab.dom.inputComposerEl).getByRole('textbox')).toBeDefined();
+    } finally { await view.dispose(); }
+  },
+);
+
+it.each(Object.keys(retainingActivity) as (keyof typeof retainingActivity)[])(
+  'retains a suggestion when the main tab starts no turn and keeps its model (%s)', async activity => {
+    const backend = new FakeSideBackend();
+    const view = await createView(backend);
+    try {
+      const turnId = await finishFakeTurn(view, backend);
+      const mainSession = backend.latest;
+      mainSession.emitSessionEvent({ type: 'prompt_suggestion', originatingTurnId: turnId, suggestion: 'Kept suggestion' });
+      const input = view.tab.dom.inputEl;
+      expect(within(input).getByText('Kept suggestion')).toBeDefined();
+      await retainingActivity[activity](view, backend);
+      expect(mainSession.requests).toHaveLength(1);
+      input.value = '';
+      fireEvent.input(input);
+      expect(within(input).getByText('Kept suggestion')).toBeDefined();
+    } finally { await view.dispose(); }
+  },
+);
+
+it('keeps content present on arrival, hides for text and attachments, then restores the ghost', async () => {
+  const backend = new FakeSideBackend();
+  const view = await createView(backend);
+  try {
+    const turnId = await finishFakeTurn(view, backend);
+    const input = view.tab.dom.inputEl;
+    input.value = 'Unsent draft';
+    fireEvent.input(input);
+    backend.latest.emitSessionEvent({ type: 'prompt_suggestion', originatingTurnId: turnId, suggestion: 'Try the tests' });
+    expect(input.value).toBe('Unsent draft');
+    expect(within(input).queryByText('Try the tests')).toBeNull();
+    input.value = '';
+    fireEvent.input(input);
+    expect(within(input).getByText('Try the tests')).toBeDefined();
+    view.tab.ui.imageContextManager.setImages([{ id: 'image', name: 'image.png', mediaType: 'image/png', data: 'aGVsbG8=', size: 5, source: 'paste' }]);
+    expect(within(input).queryByText('Try the tests')).toBeNull();
+    view.tab.ui.imageContextManager.clearImages();
+    expect(within(input).getByText('Try the tests')).toBeDefined();
+    for (const text of ['Typing', 'Pasted text', '$skill']) {
+      input.value = text;
+      fireEvent.input(input);
+      expect(within(input).queryByText('Try the tests')).toBeNull();
+      input.value = '';
+      fireEvent.input(input);
+      expect(within(input).getByText('Try the tests')).toBeDefined();
+    }
+    input.value = '/';
+    fireEvent.input(input);
+    await waitFor(() => expect(view.tab.ui.composerDropdown.isVisible()).toBe(true));
+    fireEvent.keyDown(within(input).getByRole('textbox'), { key: 'Tab', isComposing: true });
+    expect(input.value).toBe('/');
+    fireEvent.keyDown(within(input).getByRole('textbox'), { key: 'Tab' });
+    expect(input.value).not.toBe('/');
+    expect(input.value).not.toBe('Try the tests');
+    input.value = '';
+    fireEvent.input(input);
+    await waitFor(() => expect(within(input).getByText('Try the tests')).toBeDefined());
+  } finally { await view.dispose(); }
+});
+
+it.each(['before', 'after'] as const)('drops a trailing prediction while its originating tab is inactive (turn started %s switching away)', async started => {
+  const backend = new FakeSideBackend();
+  const view = await createView(backend);
+  try {
+    // A queued follow-up can start a main turn after its tab was switched away.
+    if (started === 'after') deactivateTab(view.tab);
+    const turnId = await finishFakeTurn(view, backend);
+    if (started === 'before') deactivateTab(view.tab);
+    backend.latest.emitSessionEvent({ type: 'prompt_suggestion', originatingTurnId: turnId, suggestion: 'Late prediction' });
+    activateTab(view.tab);
+    fireEvent.input(view.tab.dom.inputEl);
+    expect(within(view.tab.dom.inputComposerEl).getByRole('textbox')).toBeDefined();
+    expect(within(view.tab.dom.inputEl).queryByText('Late prediction')).toBeNull();
+  } finally { await view.dispose(); }
+});
+
+it('hides a prediction while a toolbar dropdown is open and restores it on Escape', async () => {
+  const backend = new FakeSideBackend();
+  const view = await createView(backend);
+  try {
+    const turnId = await finishFakeTurn(view, backend);
+    backend.latest.emitSessionEvent({ type: 'prompt_suggestion', originatingTurnId: turnId, suggestion: 'Try the tests' });
+    expect(within(view.tab.dom.inputEl).getByText('Try the tests')).toBeDefined();
+    const modelButton = within(view.tab.dom.inputWrapper).getByRole('button', { name: /Model: / });
+    fireEvent.click(modelButton);
+    await waitFor(() => expect(within(view.tab.dom.inputEl).queryByText('Try the tests')).toBeNull());
+    fireEvent.keyDown(modelButton, { key: 'Escape' });
+    await waitFor(() => expect(within(view.tab.dom.inputEl).getByText('Try the tests')).toBeDefined());
+  } finally { await view.dispose(); }
+});
+
+it('hides a prediction while the completion menu or resume picker is open and restores it when they close', async () => {
+  const backend = new FakeSideBackend();
+  const view = await createView(backend);
+  try {
+    const turnId = await finishFakeTurn(view, backend);
+    backend.latest.emitSessionEvent({ type: 'prompt_suggestion', originatingTurnId: turnId, suggestion: 'Try the tests' });
+    const input = view.tab.dom.inputEl;
+    const textbox = within(input).getByRole('textbox');
+    expect(within(input).getByText('Try the tests')).toBeDefined();
+    input.value = '@';
+    fireEvent.input(input);
+    await waitFor(() => expect(view.tab.ui.composerDropdown.isVisible()).toBe(true));
+    // A programmatic draft reset leaves the menu open.
+    input.value = '';
+    view.tab.ui.promptSuggestion.refresh();
+    expect(within(input).queryByText('Try the tests')).toBeNull();
+    fireEvent.keyDown(textbox, { key: 'Escape' });
+    expect(view.tab.ui.composerDropdown.isVisible()).toBe(false);
+    expect(within(input).getByText('Try the tests')).toBeDefined();
+    input.value = '/sessions';
+    await view.tab.controllers.inputController.sendMessage();
+    expect(within(document.body).getByRole('listbox', { name: 'Resume conversation' })).toBeDefined();
+    expect(within(input).queryByText('Try the tests')).toBeNull();
+    fireEvent.keyDown(textbox, { key: 'Escape' });
+    expect(within(document.body).queryByRole('listbox', { name: 'Resume conversation' })).toBeNull();
+    expect(within(input).getByText('Try the tests')).toBeDefined();
+  } finally { await view.dispose(); }
+});
+
+it.each(['', 'Unsent draft'])('discards the prediction when an automatic turn starts (draft: %o)', async draft => {
+  const backend = new FakeSideBackend();
+  const view = await createView(backend);
+  try {
+    const turnId = await finishFakeTurn(view, backend);
+    backend.latest.emitSessionEvent({ type: 'prompt_suggestion', originatingTurnId: turnId, suggestion: 'Previous prediction' });
+    expect(within(view.tab.dom.inputEl).getByText('Previous prediction')).toBeDefined();
+    view.tab.dom.inputEl.value = draft;
+    fireEvent.input(view.tab.dom.inputEl);
+    backend.latest.emitBackgroundEvent({ type: 'background_turn_started' });
+    view.tab.dom.inputEl.value = '';
+    fireEvent.input(view.tab.dom.inputEl);
+    expect(within(view.tab.dom.inputEl).queryByText('Previous prediction')).toBeNull();
+    expect(within(view.tab.dom.inputComposerEl).getByRole('textbox')).toBeDefined();
+    backend.latest.emitBackgroundEvent({ type: 'background_turn_completed', reason: 'completed' });
+  } finally { await view.dispose(); }
+});

@@ -1,0 +1,488 @@
+import { getProviderConfig } from '@/core/providers/providerConfig';
+import { opencodeModelPolicy } from '@/providers/opencode/OpencodeModelPolicy';
+import { projectOpencodeModelSettings } from '@/providers/opencode/settings';
+
+import {
+  normalizeOpencodeModelAliases,
+  normalizeOpencodePreferredThinkingByModel,
+} from '../../../../src/providers/opencode/config';
+import {
+  getOpencodeProviderSettings,
+  updateOpencodeProviderSettings
+} from '../../../../src/providers/opencode/settings';
+
+describe('OpenCode settings normalization', () => {
+  const discoveredModels = [
+    { label: 'Anthropic/Claude Sonnet 4', rawId: 'anthropic/claude-sonnet-4' },
+    { label: 'Anthropic/Claude Sonnet 4 (high)', rawId: 'anthropic/claude-sonnet-4/high' },
+    { label: 'Google/Gemini 2.5 Pro', rawId: 'google/gemini-2.5-pro' },
+  ];
+
+  beforeEach(() => {
+    vi.clearAllMocks();
+  });
+
+  it('does not migrate saved variant model IDs into another selection', () => {
+    const settings = getOpencodeProviderSettings({      providerConfigs: {        opencode: {
+          discoveredModels,
+          visibleModels: ['anthropic/claude-sonnet-4/high', 'anthropic/claude-sonnet-4'],
+          preferredThinkingByModel: { 'anthropic/claude-sonnet-4/high': 'high' },
+          modelAliases: { 'anthropic/claude-sonnet-4/high': 'Saved alias' },
+        }      }    });
+    expect(settings.visibleModels).toEqual(['anthropic/claude-sonnet-4/high', 'anthropic/claude-sonnet-4']);
+    expect(settings.preferredThinkingByModel).toEqual({ 'anthropic/claude-sonnet-4/high': 'high' });
+    expect(settings.modelAliases).toEqual({ 'anthropic/claude-sonnet-4/high': 'Saved alias' });
+  });
+
+  it('preserves preferred thinking keys', () => {
+    expect(normalizeOpencodePreferredThinkingByModel({
+      'anthropic/claude-sonnet-4/high': 'high',
+      'google/gemini-2.5-pro': 'max',
+    })).toEqual({
+      'anthropic/claude-sonnet-4/high': 'high',
+      'google/gemini-2.5-pro': 'max',
+    });
+  });
+
+  it('hydrates provider settings without rewriting model identities', () => {
+    expect(getOpencodeProviderSettings({
+      providerConfigs: {
+        opencode: {
+          cliPath: '/legacy/opencode',
+          cliPathsByHost: {
+            'host-a': '/host-a/opencode',
+            'host-b': '/host-b/opencode',
+          },
+          discoveredModels,
+          preferredThinkingByModel: {
+            'anthropic/claude-sonnet-4/high': 'high',
+          },
+          visibleModels: [
+            'anthropic/claude-sonnet-4/high',
+            'google/gemini-2.5-pro',
+          ],
+        },
+      },
+    })).toMatchObject({
+      preferredThinkingByModel: {
+        'anthropic/claude-sonnet-4/high': 'high',
+      },
+      cliPath: '/legacy/opencode',
+      cliPathsByHost: {
+        'host-a': '/host-a/opencode',
+        'host-b': '/host-b/opencode',
+      },
+      visibleModels: [
+        'anthropic/claude-sonnet-4/high',
+        'google/gemini-2.5-pro',
+      ],
+    });
+  });
+
+  it('preserves hostname-scoped CLI paths without assigning them to the current device', () => {
+
+    const settings = getOpencodeProviderSettings({
+      providerConfigs: {
+        opencode: {
+          cliPathsByHost: {
+            'host-a': '/host-a/opencode',
+            'host-b': '/host-b/opencode',
+          },
+        },
+      },
+    });
+
+    expect(settings.cliPathsByHost).toEqual({
+      'host-a': '/host-a/opencode',
+      'host-b': '/host-b/opencode',
+    });
+  });
+
+  it('rejects arrays and filters mixed hostname CLI maps', () => {
+    expect(getOpencodeProviderSettings({
+      providerConfigs: { opencode: { cliPathsByHost: ['/array/opencode'] } },
+    }).cliPathsByHost).toEqual({});
+    expect(getOpencodeProviderSettings({
+      providerConfigs: {
+        opencode: {
+          cliPathsByHost: { ' host-a ': ' /host-a/opencode ', invalid: false },
+        },
+      },
+    }).cliPathsByHost).toEqual({ 'host-a': '/host-a/opencode' });
+  });
+
+  it('preserves model alias keys and trims values', () => {
+    expect(normalizeOpencodeModelAliases({
+      'anthropic/claude-sonnet-4/high': '  Sonnet  ',
+      'google/gemini-2.5-pro': 'Gemini Pro',
+      'unknown/model': 'ignored',
+      'anthropic/claude-sonnet-4': '',
+    })).toEqual({
+      'anthropic/claude-sonnet-4/high': 'Sonnet',
+      'google/gemini-2.5-pro': 'Gemini Pro',
+      'unknown/model': 'ignored',
+    });
+  });
+
+  it('ignores non-string and non-object alias payloads', () => {
+    expect(normalizeOpencodeModelAliases(null)).toEqual({});
+    expect(normalizeOpencodeModelAliases(['alias'])).toEqual({});
+    expect(normalizeOpencodeModelAliases({ 'anthropic/claude-sonnet-4': 123 })).toEqual({});
+  });
+
+  it('prunes aliases whose rawId is no longer visible when updating settings', () => {
+    const settings: Record<string, unknown> = {
+      providerConfigs: {
+        opencode: {
+          discoveredModels,
+          modelAliases: {
+            'anthropic/claude-sonnet-4': 'Sonnet',
+            'google/gemini-2.5-pro': 'Gemini',
+          },
+          visibleModels: [
+            'anthropic/claude-sonnet-4',
+            'google/gemini-2.5-pro',
+          ],
+        },
+      },
+    };
+
+    const next = updateOpencodeProviderSettings(settings, {
+      visibleModels: ['anthropic/claude-sonnet-4'],
+    });
+
+    expect(next.visibleModels).toEqual(['anthropic/claude-sonnet-4']);
+    expect(next.modelAliases).toEqual({ 'anthropic/claude-sonnet-4': 'Sonnet' });
+    expect(projectOpencodeModelSettings(settings).discoveredModels).toBeUndefined();
+  });
+
+  it('preserves active and saved OpenCode selections when the current model is removed from visible models', () => {
+    const settings: Record<string, unknown> = {
+      effortLevel: 'high',
+      model: 'opencode:google/gemini-2.5-pro',
+      providerConfigs: {
+        opencode: {
+          discoveredModels: [
+            ...discoveredModels,
+            { label: 'OpenAI/GPT-5', rawId: 'openai/gpt-5' },
+            { label: 'OpenAI/GPT-5 (high)', rawId: 'openai/gpt-5/high' },
+          ],
+          preferredThinkingByModel: {
+            'openai/gpt-5': 'high',
+          },
+          visibleModels: [
+            'google/gemini-2.5-pro',
+            'openai/gpt-5',
+          ],
+        },
+      },
+      savedProviderEffort: {
+        opencode: 'high',
+      },
+      savedProviderModel: {
+        opencode: 'opencode:google/gemini-2.5-pro',
+      },
+      titleGenerationModel: 'opencode:google/gemini-2.5-pro',
+    };
+
+    const next = updateOpencodeProviderSettings(settings, {
+      visibleModels: ['openai/gpt-5'],
+    });
+
+    expect(next.visibleModels).toEqual(['openai/gpt-5']);
+    expect(settings.model).toBe('opencode:google/gemini-2.5-pro');
+    expect(settings.effortLevel).toBe('high');
+    expect((settings.savedProviderModel as Record<string, string>).opencode).toBe('opencode:google/gemini-2.5-pro');
+    expect((settings.savedProviderEffort as Record<string, string>).opencode).toBe('high');
+    expect(settings.titleGenerationModel).toBe('opencode:google/gemini-2.5-pro');
+  });
+
+  it('preserves the OpenCode title model when all visible models are removed', () => {
+    const settings: Record<string, unknown> = {
+      providerConfigs: {
+        opencode: {
+          discoveredModels,
+          visibleModels: ['google/gemini-2.5-pro'],
+        },
+      },
+      titleGenerationModel: 'opencode:google/gemini-2.5-pro',
+    };
+
+    const next = updateOpencodeProviderSettings(settings, {
+      visibleModels: [],
+    });
+
+    expect(next.visibleModels).toEqual([]);
+    expect(settings.titleGenerationModel).toBe('opencode:google/gemini-2.5-pro');
+  });
+
+  it('keeps runtime discovery in memory when updating provider settings', () => {
+    const settings: Record<string, unknown> = {
+      providerConfigs: {
+        opencode: {
+          availableModes: [
+            { id: 'build', name: 'Build' },
+          ],
+          discoveredModels,
+          selectedMode: 'claudian-safe',
+          visibleModels: ['anthropic/claude-sonnet-4'],
+        },
+      },
+    };
+
+    const next = updateOpencodeProviderSettings(settings, {
+      discoveredModels: [
+        ...discoveredModels,
+        { label: 'OpenAI/GPT-5', rawId: 'openai/gpt-5' },
+      ],
+    });
+
+    expect(next.discoveredModels).toEqual([
+      ...discoveredModels,
+      { label: 'OpenAI/GPT-5', rawId: 'openai/gpt-5' },
+    ]);
+    // Retired mode-as-agent state is dropped from the persisted projection.
+    expect(projectOpencodeModelSettings(settings).availableModes).toBeUndefined();
+    expect(projectOpencodeModelSettings(settings).selectedMode).toBeUndefined();
+    expect(projectOpencodeModelSettings(settings).discoveredModels).toBeUndefined();
+  });
+
+  it('persists thinking options only for visible or selected OpenCode models', () => {
+    const settings: Record<string, unknown> = {
+      model: 'opencode:google/gemini-2.5-pro',
+      providerConfigs: {
+        opencode: {
+          discoveredModels,
+          visibleModels: ['anthropic/claude-sonnet-4'],
+        },
+      },
+      savedProviderModel: {
+        opencode: 'opencode:google/gemini-2.5-pro',
+      },
+    };
+
+    const next = updateOpencodeProviderSettings(settings, {
+      thinkingOptionsByModel: {
+        'anthropic/claude-sonnet-4': [
+          { label: 'High', value: 'high' },
+        ],
+        'google/gemini-2.5-pro': [
+          { label: 'Low', value: 'low' },
+        ],
+        'openai/gpt-5': [
+          { label: 'Max', value: 'max' },
+        ],
+      },
+    });
+
+    expect(next.thinkingOptionsByModel).toMatchObject({
+      'anthropic/claude-sonnet-4': [
+        { label: 'High', value: 'high' },
+      ],
+      'google/gemini-2.5-pro': [
+        { label: 'Low', value: 'low' },
+      ],
+    });
+    expect(projectOpencodeModelSettings(settings).thinkingOptionsByModel).toEqual({
+      'anthropic/claude-sonnet-4': [
+        { label: 'High', value: 'high' },
+      ],
+    });
+    expect(projectOpencodeModelSettings(settings).discoveredModels).toBeUndefined();
+  });
+
+  it('hydrates persisted thinking options without requiring the full discovered model catalog', () => {
+    const settings = getOpencodeProviderSettings({
+      providerConfigs: {
+        opencode: {
+          thinkingOptionsByModel: {
+            'deepseek/deepseek-v4-pro': [
+              { label: 'Low', value: 'low' },
+              { label: 'Max', value: 'max' },
+            ],
+          },
+          visibleModels: ['deepseek/deepseek-v4-pro'],
+        },
+      },
+    });
+
+    expect(settings.discoveredModels).toEqual([]);
+    expect(settings.thinkingOptionsByModel).toEqual({
+      'deepseek/deepseek-v4-pro': [
+        { label: 'Low', value: 'low' },
+        { label: 'Max', value: 'max' },
+      ],
+    });
+  });
+
+  it('preserves persisted thinking options when unrelated provider settings are updated', () => {
+    const settings: Record<string, unknown> = {
+      providerConfigs: {
+        opencode: {
+          environmentHash: '',
+          thinkingOptionsByModel: {
+            'deepseek/deepseek-v4-pro': [
+              { label: 'Low', value: 'low' },
+              { label: 'Max', value: 'max' },
+            ],
+          },
+          visibleModels: ['deepseek/deepseek-v4-pro'],
+        },
+      },
+    };
+
+    updateOpencodeProviderSettings(settings, {
+      environmentHash: 'OPENCODE_DB=/tmp/opencode.db',
+    });
+
+    expect(projectOpencodeModelSettings(settings).thinkingOptionsByModel).toEqual({
+      'deepseek/deepseek-v4-pro': [
+        { label: 'Low', value: 'low' },
+        { label: 'Max', value: 'max' },
+      ],
+    });
+  });
+
+  it('preserves legacy cliPath when no host-scoped path exists', () => {
+    expect(getOpencodeProviderSettings({
+      providerConfigs: {
+        opencode: {
+          cliPath: '/legacy/opencode',
+          cliPathsByHost: {
+            'host-b': '/other-host/opencode',
+          },
+        },
+      },
+    })).toMatchObject({
+      cliPath: '/legacy/opencode',
+      cliPathsByHost: {
+        'host-b': '/other-host/opencode',
+      },
+    });
+  });
+
+  it('writes host-scoped cli paths when updating provider settings', () => {
+    const settings: Record<string, unknown> = {
+      providerConfigs: {
+        opencode: {
+          cliPath: '/legacy/opencode',
+        },
+      },
+    };
+
+    const next = updateOpencodeProviderSettings(settings, {
+      cliPathsByHost: {
+        'host-a': '/custom/opencode',
+      },
+    });
+
+    expect(next.cliPathsByHost).toEqual({
+      'host-a': '/custom/opencode',
+    });
+    expect(getProviderConfig(settings, 'opencode').cliPathsByHost).toEqual({
+      'host-a': '/custom/opencode',
+    });
+  });
+
+  it('preserves legacy cliPath when applying a full settings snapshot', () => {
+    const settings: Record<string, unknown> = {
+      providerConfigs: {
+        opencode: {
+          cliPath: '/legacy/opencode',
+          cliPathsByHost: {
+            'host-b': '/other-host/opencode',
+          },
+        },
+      },
+    };
+
+    const snapshot = getOpencodeProviderSettings(settings);
+    const next = updateOpencodeProviderSettings(settings, snapshot);
+
+    expect(next.cliPath).toBe('/legacy/opencode');
+    expect(getProviderConfig(settings, 'opencode')).toMatchObject({
+      cliPath: '/legacy/opencode',
+      cliPathsByHost: {
+        'host-b': '/other-host/opencode',
+      },
+    });
+  });
+
+  it('drops the legacy cliPath once host-scoped paths are explicitly edited', () => {
+    const settings: Record<string, unknown> = {
+      providerConfigs: {
+        opencode: {
+          cliPath: '/legacy/opencode',
+        },
+      },
+    };
+
+    const next = updateOpencodeProviderSettings(settings, {
+      cliPathsByHost: {
+        'host-a': '/custom/opencode',
+      },
+    });
+
+    expect(next.cliPath).toBe('');
+    expect(getProviderConfig(settings, 'opencode').cliPath).toBe('');
+
+    const cleared = updateOpencodeProviderSettings(settings, {
+      cliPathsByHost: {},
+    });
+
+    expect(cleared.cliPath).toBe('');
+    expect(cleared.cliPathsByHost).toEqual({});
+    expect(getProviderConfig(settings, 'opencode')).toMatchObject({
+      cliPath: '',
+      cliPathsByHost: {},
+    });
+  });
+});
+
+it('round-trips an own prototype-named alias and reasoning entry through configuration writers', () => {
+  const settings: Record<string, unknown> = {};
+  const aliases = JSON.parse('{"__proto__":"Gateway alias"}') as Record<string, string>;
+  const thinking = JSON.parse('{"__proto__":"high"}') as Record<string, string>;
+  updateOpencodeProviderSettings(settings, { visibleModels: ['__proto__'], modelAliases: aliases, preferredThinkingByModel: thinking });
+  const reloaded = getOpencodeProviderSettings(JSON.parse(JSON.stringify(settings)));
+  expect(Object.entries(reloaded.modelAliases)).toEqual([['__proto__', 'Gateway alias']]);
+  expect(Object.entries(reloaded.preferredThinkingByModel)).toEqual([['__proto__', 'high']]);
+});
+
+it.each(['constructor', 'toString', '__proto__'])('keeps the native OpenCode label and default reasoning for %s without own metadata', id => {
+  const settings: Record<string, unknown> = {};
+  updateOpencodeProviderSettings(settings, { visibleModels: [id], discoveredModels: [{ rawId: id, label: 'Gateway model' }] });
+  expect(opencodeModelPolicy.getModelOptions(settings)).toEqual([expect.objectContaining({ label: 'Gateway model' })]);
+  expect(typeof opencodeModelPolicy.getDefaultReasoningValue?.('opencode:' + id, settings)).toBe('string');
+  expect(opencodeModelPolicy.getReasoningOptions?.('opencode:' + id, settings)).toEqual([]);
+});
+
+it('projects a selected prototype-named OpenCode model with its own reasoning variants', () => {
+  const settings: Record<string, unknown> = {};
+  updateOpencodeProviderSettings(settings, { visibleModels: ['__proto__'], discoveredModels: [{ rawId: '__proto__', label: 'Gateway model' }],
+    thinkingOptionsByModel: JSON.parse('{"__proto__":[{"value":"high","label":"High"}]}'),
+  });
+  const reopened = getOpencodeProviderSettings({ providerConfigs: { opencode: JSON.parse(JSON.stringify(projectOpencodeModelSettings(settings))) } });
+  expect(Object.entries(reopened.thinkingOptionsByModel)).toEqual([['__proto__', [{ value: 'high', label: 'High' }]]]);
+});
+
+it.each([
+  { alias: undefined, label: 'Gateway model' },
+  { alias: 'Saved alias', label: 'Saved alias' },
+])('retains native upstream grouping when a prototype-named model uses $alias', ({ alias, label }) => {
+  const settings: Record<string, unknown> = {};
+  updateOpencodeProviderSettings(settings, { visibleModels: ['constructor'], discoveredModels: [{ rawId: 'constructor', label: 'Upstream/Gateway model' }],
+    modelAliases: alias ? { constructor: alias } : {},
+  });
+  expect(opencodeModelPolicy.getModelOptions(settings)).toEqual([expect.objectContaining({ value: 'opencode:constructor', group: 'Upstream', label })]);
+});
+
+it.each(['__proto__', 'ordinary-model'])('persists the first explicit reasoning choice for %s', id => {
+  const settings: Record<string, unknown> = {};
+  updateOpencodeProviderSettings(settings, { visibleModels: [id], discoveredModels: [{ rawId: id, label: 'Gateway model' }],
+    thinkingOptionsByModel: Object.fromEntries([[id, [{ value: 'high', label: 'High' }]]]),
+  });
+  opencodeModelPolicy.applyReasoningSelection?.('opencode:' + id, 'high', settings);
+  expect(Object.entries(getOpencodeProviderSettings(JSON.parse(JSON.stringify(settings))).preferredThinkingByModel))
+    .toEqual([[id, 'high']]);
+});

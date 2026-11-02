@@ -1,0 +1,70 @@
+/* Reasoning: the level on the model chip, and a list of levels in the model popover's last column. */
+
+/* The level stays muted while the chip brightens on hover, focus or while open. */
+.claudian-thinking-current {
+  color: var(--text-muted);
+}
+
+.claudian-thinking-current::before {
+  content: '\00B7';
+  margin-inline-end: 5px;
+}
+
+.claudian-thinking-levels {
+  display: flex;
+  flex-direction: column;
+  gap: 1px;
+}
+
+/* Compact rows: five levels and the fast switch fit the popover's fixed height without scrolling. */
+.claudian-toolbar-popover button.claudian-thinking-level,
+.claudian-toolbar-popover button.claudian-thinking-level:is(:hover, :focus, :focus-visible, :active) {
+  gap: 8px;
+  min-height: 24px;
+  padding-top: 0;
+  padding-bottom: 0;
+}
+
+.claudian-toolbar-popover button.claudian-thinking-level {
+  color: var(--text-muted);
+}
+
+.claudian-toolbar-popover button.claudian-thinking-level:is(:hover, :focus-visible) {
+  color: var(--text-normal);
+}
+
+/* The chosen level takes a tint of the active provider's accent; near-white brands read as a neutral fill. */
+.claudian-toolbar-popover button.claudian-thinking-level.selected,
+.claudian-toolbar-popover button.claudian-thinking-level.selected:is(:hover, :focus, :focus-visible, :active) {
+  background: rgba(var(--claudian-brand-rgb), 0.14);
+  color: var(--text-normal);
+  font-weight: 500;
+}
+
+/* A four-bar strength glyph, rising with the level. */
+.claudian-thinking-strength {
+  display: inline-flex;
+  flex: 0 0 auto;
+  align-items: flex-end;
+  gap: 2px;
+  height: 12px;
+}
+
+.claudian-thinking-strength > span {
+  width: 3px;
+  border-radius: 1px;
+  background: var(--background-modifier-border-hover);
+}
+
+.claudian-thinking-strength > span:nth-child(1) { height: 4px; }
+.claudian-thinking-strength > span:nth-child(2) { height: 6.5px; }
+.claudian-thinking-strength > span:nth-child(3) { height: 9px; }
+.claudian-thinking-strength > span:nth-child(4) { height: 12px; }
+
+.claudian-thinking-strength > span.is-filled {
+  background: var(--text-muted);
+}
+
+.claudian-thinking-level.selected .claudian-thinking-strength > span.is-filled {
+  background: var(--claudian-brand);
+}

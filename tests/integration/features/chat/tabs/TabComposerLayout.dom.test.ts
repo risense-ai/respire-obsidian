@@ -1,0 +1,168 @@
+/** @vitest-environment jsdom */
+import '@/providers';
+
+import { axe } from '@test/helpers/accessibility';
+import { createChatFeatureHost } from '@test/helpers/features/chat/ChatFeatureHostFixture';
+import { createSessionRuntimePool } from '@test/helpers/features/chat/SessionRuntimePoolHarness';
+import { createHarness, releaseSideChatHarnesses, type SideChatDOMHarness } from '@test/helpers/features/chat/SideChatDOMHarness';
+import { fireEvent, within } from '@testing-library/dom';
+import { App, Component, TFile } from 'obsidian';
+
+import { ProviderRegistry } from '@/core/providers/ProviderRegistry';
+import type { Conversation, UsageInfo } from '@/core/types';
+import type { ChatFeatureHost } from '@/features/chat/ChatFeatureHost';
+import { destroyTab } from '@/features/chat/tabs/TabLifecycle';
+import { createTabRuntime } from '@/features/chat/tabs/TabRuntimeFactory';
+import type { AssembledTabRuntime } from '@/features/chat/tabs/types';
+import { VaultMentionDataProvider } from '@/shared/mention/VaultMentionDataProvider';
+
+afterEach(async () => {
+  vi.restoreAllMocks();
+  await releaseSideChatHarnesses();
+});
+
+const note = Object.assign(new TFile(), {
+  path: 'Notes/Plan.md', name: 'Plan.md', basename: 'Plan', extension: 'md',
+});
+
+let backend: SideChatDOMHarness['backend'];
+
+async function createTab(linkedContentPath?: string): Promise<AssembledTabRuntime> {
+  const harness = await createHarness();
+  backend = harness.backend;
+  const app = new App();
+  Object.assign(app.vault.adapter, { basePath: '/vault' });
+  Object.assign(app.vault, {
+    on: () => ({}),
+    offref: () => undefined,
+    getAbstractFileByPath: (path: string) => (path === note.path ? note : null),
+  });
+  const conversation = {
+    id: 'conversation-1', providerId: 'claude', selectedModel: 'claude-sonnet-4-5',
+    sessionId: 'main-session', messages: harness.tab.state.messages,
+    ...(linkedContentPath ? { linkedContentPath } : {}),
+  } as Conversation;
+  const pool = createSessionRuntimePool(() => plugin);
+  const plugin: ChatFeatureHost = await createChatFeatureHost({
+    executionPersistence: {
+      registerExecutionBinding() {}, releaseExecutionBinding() {},
+      assertConversationExecutionAuthority: async () => undefined,
+      persistExecutionSnapshot: async () => true, recordConversationActivity: async () => undefined,
+    },
+    providerHost: harness.plugin.providerHost, bindSessionTools: harness.plugin.bindSessionTools, projects: harness.plugin.projects, sessionRuntimes: pool,
+    app,
+    getCommittedSettings: () => plugin.settings,
+    settings: {
+      model: 'claude-sonnet-4-5', effortLevel: 'high', permissionMode: 'normal',
+      providerConfigs: { claude: { enabled: true, visibleModels: ['claude-sonnet-4-5'],
+        discoveredModels: [{ value: 'claude-sonnet-4-5', label: 'Sonnet', supportedEffortLevels: ['low', 'high'] }] } },
+    },
+    getActiveEnvironmentVariables: () => '',
+    getConversationSummary: () => conversation,
+    getConversationSync: () => conversation,
+    getConversationById: async () => conversation,
+    getConversationList: () => [{ ...conversation, messageCount: conversation.messages.length, preview: '' }],
+  });
+  const tab = await createTabRuntime({
+    plugin,
+    component: Object.assign(new Component(), { registerDomEvent: () => undefined, registerEvent: () => undefined }) as never,
+    containerEl: document.body.appendChild(document.createElement('div')),
+    conversation,
+    getProviderCatalogConfig: () => null,
+    isRuntimeLive: () => true,
+    openConversation: async () => {}, startNewConversation: async () => {},
+    mentionDataProvider: new VaultMentionDataProvider(app),
+  });
+  tab.state.messages = conversation.messages;
+  return tab;
+}
+
+function infoRowOf(tab: AssembledTabRuntime): HTMLElement {
+  // The info row is the composer's last row, directly under the bordered input box.
+  const row = tab.dom.inputWrapper.nextElementSibling as HTMLElement | null;
+  expect(row?.parentElement).toBe(tab.dom.inputContainerEl);
+  return row!;
+}
+
+const usage = (percentage: number): UsageInfo => ({
+  model: 'claude-sonnet-4-5', inputTokens: percentage * 2000, cacheCreationInputTokens: 0, cacheReadInputTokens: 0,
+  contextTokens: percentage * 2000, contextWindow: 200000, percentage,
+});
+
+it('attaches a queued follow-up to the top of the input box, under the tab bar', async () => {
+  const tab = await createTab();
+  try {
+    const box = within(tab.dom.inputWrapper);
+    expect(box.queryByRole('button', { name: 'Discard queued message' })).toBeNull();
+
+    vi.spyOn(ProviderRegistry, 'getCapabilities').mockReturnValue({
+      ...ProviderRegistry.getCapabilities('claude'), supportsTurnSteer: true,
+    });
+    // A real provider handoff gives the coordinator the active execution that admits steering.
+    const handoff = backend.nextRequest(() => true);
+    const sending = tab.controllers.inputController.sendMessage({ content: 'draft the plan' });
+    await handoff;
+    tab.controllers.inputController.queue.enqueue({
+      content: 'also add a created date', turnRequest: { text: 'also add a created date' },
+    });
+
+    const strip = tab.dom.queueIndicatorEl;
+    expect(strip.parentElement).toBe(tab.dom.inputWrapper);
+    expect(tab.dom.inputWrapper.firstElementChild).toBe(strip);
+    expect(tab.dom.navRowEl.compareDocumentPosition(strip) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy();
+    expect(strip.classList.contains('claudian-hidden')).toBe(false);
+    expect(within(strip).getByText('Queued')).toBeDefined();
+    expect(within(strip).getByText('also add a created date')).toBeDefined();
+    expect(box.getByRole('button', { name: 'Steer Now' })).toBeDefined();
+    expect(box.getByRole('button', { name: 'Discard queued message' })).toBeDefined();
+    expect(await axe(strip)).toHaveNoViolations();
+
+    fireEvent.click(box.getByRole('button', { name: 'Edit queued message' }));
+    expect(tab.state.queuedMessage).toBeNull();
+    expect(strip.classList.contains('claudian-hidden')).toBe(true);
+    expect(box.queryByRole('button', { name: 'Edit queued message' })).toBeNull();
+    expect(tab.dom.inputEl.value).toBe('also add a created date');
+    backend.latest.complete();
+    await sending;
+  } finally {
+    await destroyTab(tab);
+  }
+});
+
+it('shows the linked note in an info row under the input box', async () => {
+  const tab = await createTab(note.path);
+  try {
+    const row = infoRowOf(tab);
+    const info = within(row);
+    const linked = info.getByRole('button', { name: 'Linked content: Notes/Plan.md' });
+    expect(linked.textContent).toBe('Plan');
+    // Locked after the first message: shown, activatable, not removable.
+    expect(info.queryByRole('button', { name: /^Remove/ })).toBeNull();
+    // The in-box tray is left to per-turn context.
+    expect(within(tab.dom.inputWrapper).queryByRole('button', { name: /Linked content/ })).toBeNull();
+
+    tab.state.usage = usage(42);
+    expect(info.queryByRole('progressbar')).toBeNull();
+    expect(await axe(row)).toHaveNoViolations();
+  } finally {
+    await destroyTab(tab);
+  }
+});
+
+it('shows context usage in the toolbar next to the model picker', async () => {
+  const tab = await createTab();
+  try {
+    // Without a linked note the row still holds its place, so the composer does not shift.
+    const row = infoRowOf(tab);
+    expect(row.classList.contains('claudian-hidden')).toBe(false);
+
+    tab.state.usage = usage(42);
+    const toolbar = tab.dom.inputWrapper.querySelector<HTMLElement>(':scope > .claudian-input-toolbar')!;
+    const meter = within(toolbar).getByRole('progressbar', { name: 'Context usage: 42% · 84k / 200k' });
+    const modelAnchor = toolbar.querySelector('.claudian-toolbar-chip-anchor--model');
+    expect(modelAnchor?.nextElementSibling).toBe(meter);
+    expect(within(row).queryByRole('progressbar')).toBeNull();
+  } finally {
+    await destroyTab(tab);
+  }
+});

@@ -1,0 +1,113 @@
+import { resolveExecutionTarget } from '@/core/process/execution-target/ExecutionTargetResolver';
+import type { ExecutionTarget } from '@/core/process/execution-target/types';
+import { SESSION_TOOLS } from '@/core/tools/toolNames';
+
+import type { PiProviderSettings } from '../config';
+import { isPiSessionPathReference } from '../history/PiHistoryPathResolver';
+import { decodePiModelId, normalizePiThinkingLevel } from '../models';
+import type { PiProviderState } from '../types';
+import { piTargetPath } from './piTargetPaths';
+
+export interface BuildPiLaunchSpecParams {
+  executionTarget?: ExecutionTarget;
+  command: string;
+  cwd: string;
+  env?: NodeJS.ProcessEnv;
+  envText?: string;
+  model?: string | null;
+  noSession?: boolean;
+  noTools?: boolean;
+  readOnlyTools?: boolean;
+  tools?: readonly string[];
+  providerState?: PiProviderState | null;
+  settings: PiProviderSettings;
+  systemPrompt?: string;
+  thinkingLevel?: string | null;
+  enableSessionTools?: boolean;
+  enableTreeBridge?: boolean;
+}
+
+export interface PiLaunchSpec {
+  executionTarget?: ExecutionTarget;
+  envText?: string;
+  enableSessionTools?: boolean;
+  enableTreeBridge?: boolean;
+  args: string[];
+  command: string;
+  cwd: string;
+  env: NodeJS.ProcessEnv;
+  processKey: string;
+  sessionTarget: string | null;
+}
+
+const READONLY_TOOLS = 'read,grep,find,ls';
+
+export function buildPiLaunchSpec(params: BuildPiLaunchSpecParams): PiLaunchSpec {
+  const target = params.executionTarget ?? resolveExecutionTarget({ settings: params.settings, hostVaultPath: params.cwd });
+  const args = ['--mode', 'rpc'];
+  let sessionFlagIndex: number | null = null;
+  const storedTarget = params.providerState?.sessionFile
+    ?? params.providerState?.sessionId
+    ?? null;
+  const sessionTarget = isPiSessionPathReference(storedTarget) ? piTargetPath(storedTarget, target) : storedTarget;
+  const systemPrompt = params.systemPrompt;
+  if (systemPrompt) {
+    args.push('--system-prompt', systemPrompt);
+  }
+
+  if (params.noSession) {
+    args.push('--no-session');
+  } else if (sessionTarget) {
+    sessionFlagIndex = args.length;
+    args.push('--session', sessionTarget);
+  }
+
+  if (params.noTools) {
+    args.push('--no-tools');
+  } else if (params.tools) {
+    args.push('--tools', [...new Set([...params.tools, ...(params.enableSessionTools ? SESSION_TOOLS : [])])].join(','));
+  } else if (params.readOnlyTools) {
+    args.push('--tools', [READONLY_TOOLS, ...(params.enableSessionTools ? SESSION_TOOLS : [])].join(','));
+  }
+
+  const decodedModel = typeof params.model === 'string' ? decodePiModelId(params.model) : null;
+  if (decodedModel) {
+    args.push('--provider', decodedModel.provider, '--model', decodedModel.modelId);
+  }
+
+  const thinkingLevel = normalizePiThinkingLevel(params.thinkingLevel);
+  if (thinkingLevel && thinkingLevel !== 'off') {
+    args.push('--thinking', thinkingLevel);
+  }
+
+  return {
+    executionTarget: target,
+    envText: params.envText ?? params.settings.environmentVariables,
+    ...(params.enableSessionTools ? { enableSessionTools: true } : {}),
+    ...(params.enableTreeBridge ? { enableTreeBridge: true } : {}),
+    args,
+    command: params.command,
+    cwd: params.cwd,
+    env: params.env ?? process.env,
+    processKey: JSON.stringify({
+      target,
+      enableSessionTools: params.enableSessionTools === true,
+      args: withoutSessionTarget(args, sessionFlagIndex),
+      command: params.command,
+      cwd: params.cwd,
+      envText: params.envText ?? params.settings.environmentVariables,
+    }),
+    sessionTarget: params.noSession ? null : sessionTarget,
+  };
+}
+
+function withoutSessionTarget(
+  args: readonly string[],
+  sessionFlagIndex: number | null,
+): string[] {
+  if (sessionFlagIndex === null) return [...args];
+  return [
+    ...args.slice(0, sessionFlagIndex),
+    ...args.slice(sessionFlagIndex + 2),
+  ];
+}

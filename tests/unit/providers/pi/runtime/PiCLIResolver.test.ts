@@ -1,0 +1,149 @@
+import * as fs from 'fs';
+import * as path from 'path';
+import type { Mock } from 'vitest';
+
+import { getInstallationKey } from '@/core/device/InstallationKey';
+import { PiCLIResolver } from '@/providers/pi/runtime/PiCLIResolver';
+
+vi.mock('fs');
+const mockedStat = fs.statSync as Mock;
+
+describe('PiCLIResolver', () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+    (fs.existsSync as Mock).mockReturnValue(false);
+  });
+
+  it('resolves a Linux CLI without inspecting Windows shims for WSL', () => {
+    const resolver = new PiCLIResolver();
+    expect(resolver.resolveFromSettings({ providerConfigs: { pi: {
+      cliPathsByHost: { [getInstallationKey()]: '/home/me/.local/bin/pi' }, cliPath: 'C:\\Tools\\pi.cmd',
+    } } }, { executionTarget: { method: 'wsl', platformFamily: 'unix', platformOs: 'linux', distroName: 'Ubuntu' } }))
+      .toBe('/home/me/.local/bin/pi');
+    expect(mockedStat).not.toHaveBeenCalled();
+  });
+
+  it('resolves the current host path before the legacy Pi CLI path', () => {
+    mockedStat.mockImplementation((filePath: string) => {
+      if (filePath === '/current/pi') {
+        return { isFile: () => true };
+      }
+      throw new Error(`ENOENT: ${filePath}`);
+    });
+
+    const resolver = new PiCLIResolver();
+
+    expect(resolver.resolveFromSettings({
+      providerConfigs: {
+        pi: {
+          cliPathsByHost: {
+            [getInstallationKey()]: '/current/pi',
+            'other-host': '/other/pi',
+          },
+          cliPath: '/legacy/pi',
+        },
+      },
+    })).toBe('/current/pi');
+  });
+
+  it('falls back to cliPath and returns null for invalid paths', () => {
+    mockedStat.mockImplementation((filePath: string) => {
+      if (filePath === '/legacy/pi') {
+        return { isFile: () => true };
+      }
+      throw new Error(`ENOENT: ${filePath}`);
+    });
+
+    const resolver = new PiCLIResolver();
+    const settings = {
+      providerConfigs: {
+        pi: {
+          cliPathsByHost: { 'other-host': '/other/pi' },
+          cliPath: '/legacy/pi',
+        },
+      },
+    };
+    expect(resolver.resolveFromSettings(settings)).toBe('/legacy/pi');
+
+    mockedStat.mockImplementation(() => {
+      throw new Error('ENOENT');
+    });
+    resolver.reset();
+    expect(resolver.resolveFromSettings(settings)).toBeNull();
+  });
+
+  it('falls back to PATH lookup when no Pi CLI path is configured', () => {
+    const pathDir = '/custom/bin';
+    const pathBinary = path.join(pathDir, 'pi');
+    mockedStat.mockImplementation((filePath: string) => {
+      if (filePath === pathBinary) {
+        return { isFile: () => true };
+      }
+      throw new Error(`ENOENT: ${filePath}`);
+    });
+
+    const resolver = new PiCLIResolver();
+
+    expect(resolver.resolveFromSettings({
+      providerConfigs: {
+        pi: { environmentVariables: `PATH=${pathDir}` },
+      },
+    })).toBe(pathBinary);
+  });
+
+  it('invalidates cached resolutions when provider environment changes', () => {
+    mockedStat.mockImplementation((filePath: string) => {
+      if (filePath === '/current/pi') {
+        return { isFile: () => true };
+      }
+      throw new Error(`ENOENT: ${filePath}`);
+    });
+
+    const resolver = new PiCLIResolver();
+    const firstSettings = {
+      providerConfigs: {
+        pi: {
+          cliPathsByHost: {
+            [getInstallationKey()]: '/current/pi',
+          },
+          environmentVariables: 'PI_OFFLINE=0',
+        },
+      },
+    };
+    const secondSettings = {
+      providerConfigs: {
+        pi: {
+          cliPathsByHost: {
+            [getInstallationKey()]: '/current/pi',
+          },
+          environmentVariables: 'PI_OFFLINE=1',
+        },
+      },
+    };
+
+    expect(resolver.resolveFromSettings(firstSettings)).toBe('/current/pi');
+    expect(resolver.resolveFromSettings(firstSettings)).toBe('/current/pi');
+    expect(mockedStat).toHaveBeenCalledTimes(1);
+
+    expect(resolver.resolveFromSettings(secondSettings)).toBe('/current/pi');
+    expect(mockedStat).toHaveBeenCalledTimes(2);
+  });
+
+  it('caches null settings resolutions until reset', () => {
+    mockedStat.mockImplementation(() => {
+      throw new Error('ENOENT');
+    });
+    const resolver = new PiCLIResolver();
+    const settings = { providerConfigs: { pi: {} } };
+
+    expect(resolver.resolveFromSettings(settings)).toBeNull();
+    const firstCallCount = mockedStat.mock.calls.length;
+    expect(firstCallCount).toBeGreaterThan(0);
+    expect(resolver.resolveFromSettings(settings)).toBeNull();
+    expect(mockedStat).toHaveBeenCalledTimes(firstCallCount);
+
+    resolver.reset();
+    expect(resolver.resolveFromSettings(settings)).toBeNull();
+    expect(mockedStat.mock.calls.length).toBeGreaterThan(firstCallCount);
+  });
+});

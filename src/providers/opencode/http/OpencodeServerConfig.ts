@@ -1,0 +1,86 @@
+import { unwatchFile,watchFile } from 'node:fs';
+import * as fs from 'node:fs/promises';
+import * as os from 'node:os';
+import * as path from 'node:path';
+
+import type { ExecutionTarget } from '@/core/process/execution-target/types';
+
+import { opencodeHostPath, opencodeTargetPath } from '../runtime/OpencodeExecutionTarget';
+import { parseOpencodeConfig, resolveOpencodeConfigPath, resolveOpencodePluginReferences, writeIfChanged } from '../runtime/OpencodeLaunchArtifacts';
+import { OPENCODE_SESSION_TOOLS_PLUGIN_SOURCE } from '../runtime/OpencodeSessionToolsPlugin';
+import { isRecord } from './OpencodeHTTPClient';
+
+/** Writable explicit-config layer; user files are read, never edited. */
+export class OpencodeServerConfig {
+  private readonly agents = new Map<string, Record<string, unknown>>();
+  private writes: Promise<void> = Promise.resolve();
+  private disposed = false;
+  private watcher?: () => void;
+  private readonly source: string | undefined;
+
+  constructor(readonly file: string, cwd: string, private readonly environment: NodeJS.ProcessEnv, readonly sessionToolsPluginPath?: string, private readonly target?: ExecutionTarget) {
+    this.source = target?.method === 'wsl' && environment.OPENCODE_CONFIG
+      ? opencodeHostPath(path.posix.resolve(opencodeTargetPath(cwd, target), environment.OPENCODE_CONFIG.startsWith('~/') ? path.posix.join(environment.HOME!, environment.OPENCODE_CONFIG.slice(2)) : opencodeTargetPath(environment.OPENCODE_CONFIG, target)), target)
+      : resolveOpencodeConfigPath(environment.OPENCODE_CONFIG, cwd);
+  }
+
+  async initialize(onError: (error: Error) => void): Promise<void> {
+    await this.write();
+    if (this.source) {
+      this.watcher = () => { void this.write().catch(error => onError(error instanceof Error ? error : new Error(String(error)))); };
+      watchFile(this.source, { persistent: false, interval: 250 }, this.watcher);
+    }
+  }
+
+  async add(agents: Record<string, Record<string, unknown>>): Promise<void> {
+    for (const [id, agent] of Object.entries(agents)) this.agents.set(id, agent);
+    await this.write();
+  }
+
+  async remove(ids: string[]): Promise<void> {
+    if (ids.length === 0) return;
+    for (const id of ids) this.agents.delete(id);
+    await this.write();
+  }
+
+  async dispose(): Promise<void> {
+    this.disposed = true;
+    if (this.source && this.watcher) unwatchFile(this.source, this.watcher);
+    await this.writes.catch(() => undefined);
+    await fs.rm(path.dirname(this.file), { recursive: true, force: true });
+  }
+
+  private write(): Promise<void> {
+    const write = this.writes.catch(() => undefined).then(async () => {
+      if (this.disposed) return;
+      const directory = this.source ? (this.target?.method === 'wsl' ? path.win32 : path).dirname(this.source) : '';
+      const base = this.source
+        ? await parseOpencodeConfig(await readExplicitConfig(this.source), this.source, this.environment, directory, this.target)
+        : {};
+      if (this.source) resolveOpencodePluginReferences(base, directory, this.target);
+      const config = { ...base, agents: { ...(isRecord(base.agents) ? base.agents : {}), ...Object.fromEntries(this.agents) } };
+      // File/environment substitutions have already been resolved, including user text.
+      await writeIfChanged(this.file, `${JSON.stringify(config, null, 2).replace(/\{(env|file):/g, '\\u007b$1:')}\n`);
+    });
+    this.writes = write;
+    return write;
+  }
+}
+
+export async function createOpencodeServerConfig(cwd: string, environment: NodeJS.ProcessEnv, sessionTools = false, target?: ExecutionTarget): Promise<OpencodeServerConfig> {
+  // Explicit config can contain credentials; never copy it into a synced vault.
+  const root = await fs.mkdtemp(path.join(os.tmpdir(), 'claudian-opencode-'));
+  try {
+    const pluginPath = sessionTools ? path.join(root, 'session-tools') : undefined;
+    if (pluginPath) {
+      await fs.mkdir(pluginPath);
+      await fs.writeFile(path.join(pluginPath, 'package.json'), JSON.stringify({ type: 'module' }));
+      await fs.writeFile(path.join(pluginPath, 'index.js'), OPENCODE_SESSION_TOOLS_PLUGIN_SOURCE);
+    }
+    return new OpencodeServerConfig(path.join(root, 'config.json'), cwd, environment, pluginPath, target);
+  } catch (error) { await fs.rm(root, { recursive: true, force: true }); throw error; }
+}
+
+async function readExplicitConfig(source: string): Promise<string> {
+  try { return await fs.readFile(source, 'utf8'); } catch { throw new Error(`Could not read OpenCode config: ${source}`); }
+}

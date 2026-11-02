@@ -1,0 +1,746 @@
+import { randomUUID } from 'node:crypto';
+
+import { parseCompactCommand } from '@/core/commands/compactCommand';
+import {
+  type ProviderBackgroundTurnCompletedEvent,
+  type ProviderBackgroundTurnStartedEvent,
+  type ProviderExecutionRequest,
+  type ProviderExecutionRun,
+  type ProviderExecutionSession,
+  type ProviderSessionConfig,
+  type ProviderSessionEvent,
+  type ProviderSessionInvalidationReason,
+  type ProviderSessionSnapshot,
+  type ProviderSessionStatus,
+  RequestedRunChannel,
+  SessionSnapshotState,
+  type SteerableExecutionSession,
+} from '@/core/execution';
+import type { ProviderRuntimeHost } from '@/core/providers/ProviderRuntimeHost';
+import type { ChatMessage } from '@/core/types';
+
+import { ProviderModelUnavailableError } from '../../../core/providers/models/ProviderModelUnavailableError';
+import { listOpencodeThinkingLevels } from '../http/OpencodeNativeModelCatalog';
+import type { OpencodeServerService } from '../http/OpencodeServerService';
+import { projectOpencodeMetadata } from '../metadata/OpencodeMetadataProjection';
+import { decodeOpencodeModelId, OPENCODE_DEFAULT_THINKING_LEVEL } from '../models';
+import { buildOpencodePrompt } from '../runtime/buildOpencodePrompt';
+import { AUX_AGENT_IDS, OPENCODE_BUILD_AGENT_ID } from '../runtime/OpencodeExecutionAgents';
+import { assertOpencodeModelAvailable } from '../runtime/OpencodeModelAvailability';
+import { getOpencodeState } from '../types';
+import { OpencodeHTTPSessionKernel } from './OpencodeHTTPSessionKernel';
+import {
+  type OpencodeExecutionProfile,
+  type OpencodeNativeOutput,
+  type OpencodeNativeSessionInfo,
+  type OpencodeSessionKernel,
+  type OpencodeSessionKernelOptions,
+  OpencodeSessionMissingError,
+} from './OpencodeSessionContract';
+import { OpencodeSessionPersistence } from './OpencodeSessionPersistence';
+
+export type OpencodeSessionKernelFactory = (
+  options: OpencodeSessionKernelOptions,
+) => OpencodeSessionKernel;
+
+export interface OpencodeExecutionSessionOptions {
+  readonly serverService: OpencodeServerService;
+  readonly createKernel?: OpencodeSessionKernelFactory;
+}
+
+/** One requested run and its live-output gate. */
+interface OpencodeActiveRun {
+  readonly run: RequestedRunChannel;
+  /** Between the prompt being sent and the run ending; native output outside it is not this run's. */
+  liveOutput: boolean;
+  accepted: boolean;
+  cancellationRequested: boolean;
+  nativeCompleted: boolean;
+  /** Whether this run started or configured native work that cancellation must stop. */
+  ownsNativeWork: boolean;
+}
+
+export class OpencodeExecutionSession implements ProviderExecutionSession, SteerableExecutionSession {
+  readonly providerId = 'opencode' as const;
+  readonly sessionInstanceId = randomUUID();
+
+  private readonly persistence: OpencodeSessionPersistence;
+  private readonly createKernel: OpencodeSessionKernelFactory;
+  private activeRun: OpencodeActiveRun | null = null;
+  private kernel: OpencodeSessionKernel | null = null;
+  private kernelGeneration = 0;
+  private kernelRetired = false;
+  private kernelMetadataController = new AbortController();
+
+  private kernelConfigurationKey: string | null = null;
+  private kernelDisposalPromise: Promise<void> | null = null;
+  private nativeInfo: OpencodeNativeSessionInfo | null = null;
+  private nativeSessionId: string | null;
+  private nativeConversationContextEstablished: boolean;
+  private databasePath: string | null;
+  private readonly seedProviderState: Readonly<Record<string, unknown>>;
+  private readonly state: SessionSnapshotState;
+  private disposePromise: Promise<void> | null = null;
+  private disposed = false;
+  private lifecycleGeneration = 0;
+  private readonly backgroundScopes = new Map<string, { id: string; sequence: number; originatingTurnId?: string }>();
+  private backgroundTurn: { id: string; sequence: number } | null = null;
+
+  constructor(
+    private readonly host: ProviderRuntimeHost,
+    private readonly config: ProviderSessionConfig,
+    private readonly options: OpencodeExecutionSessionOptions,
+  ) {
+    this.persistence = new OpencodeSessionPersistence(config);
+    this.createKernel = options.createKernel
+      ?? ((kernelOptions) => new OpencodeHTTPSessionKernel(kernelOptions, options.serverService, this.persistence));
+    const providerState = getOpencodeState(config.resumeSeed?.providerState);
+    this.nativeSessionId = config.resumeSeed?.providerSessionId ?? providerState.sessionId ?? null;
+    this.seedProviderState = Object.freeze({ ...providerState });
+    this.databasePath = providerState.databasePath ?? null;
+    this.nativeConversationContextEstablished = typeof providerState
+      .nativeConversationContextEstablished === 'boolean'
+      ? providerState.nativeConversationContextEstablished
+      : this.nativeSessionId !== null;
+    this.state = new SessionSnapshotState({
+      providerId: this.providerId,
+      providerState: this.seedProviderState,
+      readProviderSessionId: () => this.nativeSessionId,
+      projectProviderState: state => ({
+        ...state,
+        ...(this.databasePath ? { databasePath: this.databasePath } : {}),
+        ...(
+          this.nativeSessionId
+          || typeof state.nativeConversationContextEstablished === 'boolean'
+            ? {
+                nativeConversationContextEstablished:
+                  this.nativeConversationContextEstablished,
+              }
+            : {}
+        ),
+      }),
+      sessionInstanceId: this.sessionInstanceId,
+    });
+  }
+
+  execute(request: ProviderExecutionRequest): ProviderExecutionRun {
+    if (this.disposed) throw new Error('OpenCode execution session is disposed');
+    if (this.activeRun || this.backgroundTurn) {
+      throw new Error('OpenCode execution session already has an active run');
+    }
+    const run = new RequestedRunChannel({
+      onCancel: () => this.#cancelRun(active),
+      sessionInstanceId: this.sessionInstanceId,
+    });
+    const active: OpencodeActiveRun = {
+      cancellationRequested: false,
+      nativeCompleted: false,
+      ownsNativeWork: false,
+      run,
+      liveOutput: false,
+      accepted: false,
+    };
+    this.activeRun = active;
+    run.attachAbortSignal(request.signal);
+    if (!active.cancellationRequested) {
+      void this.#startRun(active, request);
+    }
+    return run;
+  }
+
+  cancel(): void {
+    if (this.activeRun && !this.activeRun.run.isTerminal) {
+      this.activeRun.run.cancel();
+      return;
+    }
+    if (this.disposed || (!this.backgroundTurn && this.backgroundScopes.size === 0)) return;
+    this.lifecycleGeneration += 1;
+    this.#interruptKernel();
+    if (this.backgroundTurn) {
+      // The native interrupt records the turn's `idle` outcome as interrupted, which history replays.
+      this.#emitBackground({ type: 'background_turn_completed', reason: 'interrupted', providerSessionId: this.nativeSessionId ?? undefined });
+      this.backgroundTurn = null;
+    }
+    this.#invalidate('cancelled', true, new Error('Cancelled'));
+    this.#emitSessionSnapshot();
+    void this.#disposeKernel();
+  }
+
+  /** Accepts only while the requested run can still deliver input to its native inbox. */
+  async steer(request: ProviderExecutionRequest): Promise<boolean> {
+    try {
+      assertOpencodeModelAvailable(this.host, request.configuration.model);
+    } catch (error) {
+      if (error instanceof ProviderModelUnavailableError) return false;
+      throw error;
+    }
+    const active = this.activeRun;
+    const kernel = this.kernel;
+    const native = this.nativeInfo;
+    if (
+      !active
+      || active.run.isTerminal
+      || active.cancellationRequested
+      || !isAcceptingLiveOutput(active)
+      || !kernel
+      || !native
+      || request.signal.aborted
+    ) return false;
+    return kernel.steer(native.sessionId, buildPrompt(request, false));
+  }
+
+  getSnapshot(): ProviderSessionSnapshot {
+    return this.state.getSnapshot();
+  }
+
+  getStatus(): ProviderSessionStatus {
+    return this.state.status;
+  }
+
+  onEvent(listener: (event: ProviderSessionEvent) => void): () => void {
+    return this.state.onEvent(listener);
+  }
+
+  dispose(): Promise<void> {
+    if (this.disposePromise) return this.disposePromise;
+    this.disposed = true;
+    this.lifecycleGeneration += 1;
+    const active = this.activeRun;
+    if (active && !active.run.isTerminal) {
+      active.cancellationRequested = true;
+      active.liveOutput = false;
+      active.run.finish(active.nativeCompleted
+        ? { reason: 'completed', type: 'turn_completed' }
+        : { reason: 'session-disposed', type: 'cancelled' });
+    }
+    this.activeRun = null;
+    this.backgroundTurn = null;
+    this.state.clearListeners();
+    this.state.setStatus('disposed');
+    this.disposePromise = this.#disposeKernel().finally(() => this.persistence.dispose());
+    return this.disposePromise;
+  }
+
+  async #startRun(
+    active: OpencodeActiveRun,
+    request: ProviderExecutionRequest,
+  ): Promise<void> {
+    const { run } = active;
+    const generation = ++this.lifecycleGeneration;
+    let phase: 'connect' | 'open' | 'run' = 'connect';
+    let resumeAttempt: string | null = null;
+    try {
+      await this.options.serverService.waitUntilAvailable(request.signal);
+      if (!this.#isRunCurrent(active, generation)) return;
+      assertOpencodeModelAvailable(this.host, request.configuration.model);
+      const pendingDisposal = this.kernelDisposalPromise;
+      if (pendingDisposal) {
+        await pendingDisposal;
+        if (!this.#isRunCurrent(active, generation)) return;
+      }
+      const profile = resolveProfile(request);
+      // Instructions are fixed per kernel: a changed prompt reopens the native session on a new one at this turn.
+      const systemPrompt = request.configuration.systemInstructions.instructions;
+      const kernelConfigurationKey = JSON.stringify([profile, systemPrompt]);
+      let kernel = this.kernel;
+      let native = this.nativeInfo;
+      if (
+        kernel
+        && native
+        && (this.kernelRetired || this.kernelConfigurationKey !== kernelConfigurationKey)
+      ) {
+        // A new turn cannot reuse a retired generation or interrupt its descendants.
+        if (this.kernelRetired) {
+          await kernel.whenIdle();
+          if (!this.#isRunCurrent(active, generation)) return;
+        }
+        await this.#disposeKernel();
+        if (!this.#isRunCurrent(active, generation)) return;
+        kernel = null;
+        native = null;
+      }
+      if (!kernel || !native) {
+        active.ownsNativeWork = true;
+        const kernelGeneration = ++this.kernelGeneration;
+        this.kernelMetadataController = new AbortController();
+        kernel = this.createKernel({
+          onNativeWorkChanged: () => {
+            if (kernelGeneration === this.kernelGeneration && !this.disposed) this.#releaseRetiredKernel();
+          },
+          onSuperseded: () => {
+            if (kernelGeneration === this.kernelGeneration && !this.disposed) this.kernelMetadataController.abort();
+          },
+          onRetired: () => {
+            if (kernelGeneration !== this.kernelGeneration || this.disposed) return;
+            this.kernelRetired = true;
+            this.kernelMetadataController.abort();
+            this.#releaseRetiredKernel();
+          },
+          config: this.config,
+          databasePath: this.databasePath ?? undefined,
+          forkSource: getOpencodeState(this.seedProviderState).forkSource,
+          getActiveTurnId: () => this.activeRun?.run.turnId ?? this.backgroundTurn?.id ?? null,
+          openNativeInteraction: () => {
+            if (kernelGeneration !== this.kernelGeneration || this.disposed) return;
+            const key = randomUUID();
+            const turn = this.#openBackgroundScope(key);
+            return { turnId: turn.id, close: () => this.#closeBackgroundScope(key, 'completed') };
+          },
+          onNativeTaskStarted: (sessionId, originatingTurnId) => {
+            if (kernelGeneration !== this.kernelGeneration || this.disposed) return;
+            return this.#openBackgroundScope(sessionId, originatingTurnId).id;
+          },
+          onNativeTaskCompleted: (event) => {
+            if (kernelGeneration !== this.kernelGeneration || this.disposed) return;
+            this.state.emit(event);
+            this.#closeBackgroundScope(event.subagentId, event.status === 'completed' ? 'completed' : 'provider-ended');
+          },
+          onNativeSubagentProgress: (progress) => {
+            if (kernelGeneration !== this.kernelGeneration || this.disposed) return;
+            this.state.emit({ type: 'subagent_progress', progress });
+          },
+          onNativeTurn: (status, error, requested) => {
+            if (kernelGeneration !== this.kernelGeneration || this.disposed) return;
+            if (status === 'started' && !requested) {
+              this.state.setStatus('executing');
+              this.#emitSessionSnapshot();
+              this.backgroundTurn = { id: randomUUID(), sequence: 0 };
+              this.#emitBackground({ type: 'background_turn_started', providerSessionId: this.nativeSessionId ?? undefined });
+            } else if (status === 'completed' && !requested && this.backgroundTurn) {
+              if (error) this.#emitBackground({ type: 'notice', level: 'warning', message: error });
+              this.#emitBackground({ type: 'background_turn_completed', reason: 'completed', providerSessionId: this.nativeSessionId ?? undefined });
+              this.backgroundTurn = null;
+              this.state.setStatus(this.backgroundScopes.size ? 'executing' : 'idle');
+              this.#emitSessionSnapshot();
+              this.#releaseRetiredKernel();
+            }
+          },
+          onNativeOutput: (event, childSessionId) => {
+            if (kernelGeneration !== this.kernelGeneration || this.disposed) return;
+            const current = this.activeRun;
+            const child = childSessionId ? this.backgroundScopes.get(childSessionId) : undefined;
+            if (child && (current?.run.turnId !== child.originatingTurnId || !current || !isAcceptingLiveOutput(current))) {
+              this.#emitBackground(event, child);
+            } else if (this.backgroundTurn) {
+              this.#emitBackground(event);
+            } else if (current && isAcceptingLiveOutput(current)) {
+              this.#acceptRun(current);
+              current.run.emit(event);
+            }
+          },
+          onClosed: (error) => {
+            this.#handleKernelClosed(kernelGeneration, error);
+          },
+          host: this.host,
+          sessionInstanceId: this.sessionInstanceId,
+        });
+        this.kernel = kernel;
+        resumeAttempt = this.nativeSessionId;
+        await kernel.connect({
+          profile,
+          systemPrompt,
+          ...(resumeAttempt ? { resumeSessionId: resumeAttempt } : {}),
+        });
+        if (this.kernel === kernel) {
+          this.kernelConfigurationKey = kernelConfigurationKey;
+        }
+        if (!this.#isRunCurrent(active, generation)) return;
+        phase = 'open';
+        native = await kernel.openSession(resumeAttempt ?? undefined);
+        this.#captureNativeSessionOwnership(native, active);
+        if (!this.#isRunCurrent(active, generation)) return;
+        phase = 'run';
+        this.nativeInfo = native;
+        await projectOpencodeMetadata(this.host, { models: native.models }, this.kernelMetadataController.signal);
+      } else {
+        // Configuring a reused kernel is native work: cancellation must stop it.
+        active.ownsNativeWork = true;
+        this.state.setStatus('executing');
+        phase = 'run';
+      }
+      assertOpencodeModelAvailable(this.host, request.configuration.model);
+      await this.#applyConfiguration(kernel, native, request);
+      if (!this.#isRunCurrent(active, generation)) return;
+
+      assertOpencodeModelAvailable(this.host, request.configuration.model);
+      const text = getInputText(request);
+      const compact = parseCompactCommand(text);
+      if (compact && !this.nativeConversationContextEstablished && request.conversationHistory?.length) {
+        throw new Error('Send a normal message to restore the native conversation before using /compact.');
+      }
+      active.liveOutput = true;
+      const prompt = compact
+        ? { text: text.trim(), files: [], userText: null }
+        : buildPrompt(request, !this.nativeConversationContextEstablished);
+      const startedAt = Date.now();
+      const response = await kernel.prompt(native.sessionId, prompt, request);
+      this.#markNativeConversationContextEstablished(active);
+      if (!this.#isRunCurrent(active, generation)) return;
+      active.nativeCompleted = response.stopReason !== 'cancelled';
+      this.#acceptRun(active, response.userMessageId);
+      // Native completion is already authoritative: cancellation cannot rewrite the turn
+      // while optional statistics load, and a failed read never fails it.
+      const turnStats = active.nativeCompleted
+        ? await kernel.readTurnStats(native.sessionId, { userMessageId: response.userMessageId, startedAt }).catch(() => undefined)
+        : undefined;
+      if (!this.#isRunCurrent(active, generation)) return;
+      this.state.setStatus(this.backgroundTurn || this.backgroundScopes.size ? 'executing' : 'idle');
+      this.#emitRunSnapshot(active);
+      run.finish(response.stopReason === 'cancelled'
+        ? { reason: 'provider-cancelled', type: 'cancelled' }
+        : { reason: 'completed', type: 'turn_completed', ...(turnStats ? { turnStats } : {}) });
+      this.activeRun = null;
+      this.#releaseRetiredKernel();
+    } catch (error) {
+      if (!this.#isRunCurrent(active, generation)) return;
+      // Connection refuses a resume whose database is inaccessible; opening reports a missing session.
+      const missing = phase !== 'run'
+        && resumeAttempt !== null
+        && error instanceof OpencodeSessionMissingError
+        && error.sessionId === resumeAttempt;
+      this.#invalidate(
+        missing ? 'provider-session-missing' : 'provider-error',
+        true,
+        error,
+      );
+      this.#emitRunSnapshot(active);
+      run.finish({
+        category: error instanceof ProviderModelUnavailableError ? 'configuration' : missing ? 'provider-session-missing' : 'provider',
+        message: formatError(error),
+        ...(missing && resumeAttempt
+          ? { missingProviderSessionId: resumeAttempt }
+          : {}),
+        recoverable: true,
+        type: 'execution_error',
+      });
+      this.activeRun = null;
+      await this.#disposeKernel();
+    }
+  }
+
+  #openBackgroundScope(key: string, originatingTurnId?: string): { id: string; sequence: number } {
+    const turn = { id: randomUUID(), sequence: 0, originatingTurnId };
+    this.backgroundScopes.set(key, turn);
+    this.state.setStatus('executing');
+    this.#emitSessionSnapshot();
+    this.#emitBackground({ type: 'background_turn_started', providerSessionId: this.nativeSessionId ?? undefined }, turn);
+    return turn;
+  }
+
+  #closeBackgroundScope(key: string, reason: 'completed' | 'provider-ended'): void {
+    const turn = this.backgroundScopes.get(key);
+    if (!turn) return;
+    this.#emitBackground({ type: 'background_turn_completed', reason }, turn);
+    this.backgroundScopes.delete(key);
+    if (!this.activeRun && !this.backgroundTurn && this.backgroundScopes.size === 0) {
+      this.state.setStatus('idle');
+      this.#emitSessionSnapshot();
+      this.#releaseRetiredKernel();
+    }
+  }
+
+  #releaseRetiredKernel(): void {
+    if (this.kernelRetired && !this.activeRun && !this.backgroundTurn && this.backgroundScopes.size === 0 && !this.kernel?.hasNativeWork) {
+      void this.#disposeKernel();
+    }
+  }
+
+  #emitBackground(event: Omit<ProviderBackgroundTurnStartedEvent, 'scope'>
+    | Omit<ProviderBackgroundTurnCompletedEvent, 'scope'>
+    | OpencodeNativeOutput, turn = this.backgroundTurn): void {
+    if (!turn) return;
+    const scoped: ProviderSessionEvent = { ...event, scope: {
+      kind: 'background', sessionInstanceId: this.sessionInstanceId,
+      turnId: turn.id, sequence: ++turn.sequence,
+    } };
+    this.state.notify(scoped);
+  }
+
+  async #applyConfiguration(
+    kernel: OpencodeSessionKernel,
+    native: OpencodeNativeSessionInfo,
+    request: ProviderExecutionRequest,
+  ): Promise<void> {
+    const selectedModel = this.#resolveSelectedRawModelId(
+      request.configuration.model,
+    );
+    // `default` selects no native variant, which every selected model accepts.
+    const reasoning = request.configuration.reasoning;
+    const variant = reasoning && reasoning !== OPENCODE_DEFAULT_THINKING_LEVEL ? reasoning : undefined;
+    const model = selectedModel ? native.models.find(({ rawId }) => rawId === selectedModel) : undefined;
+    if (selectedModel) {
+      await projectOpencodeMetadata(this.host, {
+        selectedRawModelId: selectedModel,
+        thinkingLevels: listOpencodeThinkingLevels(model),
+      }, this.kernelMetadataController.signal);
+    }
+    if (reasoning && (!selectedModel || (variant && !model?.variants.includes(variant)))) {
+      throw new Error(`OpenCode model "${selectedModel}" does not support thinking level "${reasoning}".`);
+    }
+    if (selectedModel) await kernel.setModel(native.sessionId, selectedModel, variant);
+
+    const profile = resolveProfile(request);
+    // Resumed sessions may still name an agent clone from an earlier lease.
+    await kernel.setAgent(
+      native.sessionId,
+      profile === 'managed' ? OPENCODE_BUILD_AGENT_ID : AUX_AGENT_IDS[profile],
+    );
+    kernel.setAutoApprove(request.configuration.permissionMode === 'yolo');
+  }
+
+  #resolveSelectedRawModelId(explicit?: string): string | null {
+    const selection = explicit ?? this.host.selection.model ?? '';
+    return decodeOpencodeModelId(selection) ?? (selection || null);
+  }
+
+  #interruptKernel(): void {
+    if (this.nativeSessionId) {
+      try {
+        this.kernel?.cancel(this.nativeSessionId);
+      } catch {
+        // Disposal below remains authoritative when native cancellation fails.
+      }
+    }
+  }
+
+  #cancelRun(active: OpencodeActiveRun): void {
+    if (!this.#isRunCurrent(active, this.lifecycleGeneration) || active.nativeCompleted) return;
+    active.cancellationRequested = true;
+    active.liveOutput = false;
+    const generation = ++this.lifecycleGeneration;
+    if (!active.ownsNativeWork) {
+      // The kernel may still serve an earlier turn's descendants; only stop waiting.
+      this.state.setStatus(this.backgroundTurn || this.backgroundScopes.size ? 'executing' : 'idle');
+      this.#emitRunSnapshot(active);
+      active.run.finish({ reason: 'cancelled', type: 'cancelled' });
+      this.activeRun = null;
+      this.#releaseRetiredKernel();
+      return;
+    }
+    this.#interruptKernel();
+    this.#invalidate('cancelled', true, new Error('Cancelled'));
+    this.#emitRunSnapshot(active);
+    void this.#disposeKernel().finally(() => {
+      if (this.disposed || generation !== this.lifecycleGeneration) return;
+      active.run.finish({
+        reason: 'cancelled',
+        type: 'cancelled',
+      });
+      this.activeRun = null;
+    });
+  }
+
+  #handleKernelClosed(
+    kernelGeneration: number,
+    error: Error,
+  ): void {
+    if (kernelGeneration !== this.kernelGeneration) return;
+    const active = this.activeRun;
+    if (!active || active.run.isTerminal || this.disposed) {
+      if (!this.disposed) {
+        this.#invalidate('process-exited', true, error);
+        this.#emitSessionSnapshot();
+        this.#emitSessionError(error);
+      }
+      this.nativeInfo = null;
+      void this.#disposeKernel();
+      return;
+    }
+    this.lifecycleGeneration += 1;
+    this.#invalidate('process-exited', true, error);
+    this.#emitRunSnapshot(active);
+    // Native success stands; only the optional statistics read dies with the runtime.
+    active.run.finish(active.nativeCompleted
+      ? { reason: 'completed', type: 'turn_completed' }
+      : {
+          category: 'process-exited',
+          message: formatError(error),
+          recoverable: true,
+          type: 'execution_error',
+        });
+    this.activeRun = null;
+    this.nativeInfo = null;
+    void this.#disposeKernel();
+  }
+
+  #captureNativeSessionOwnership(
+    native: OpencodeNativeSessionInfo,
+    active: OpencodeActiveRun,
+  ): void {
+    if (this.disposed) return;
+    this.nativeSessionId = native.sessionId;
+    this.databasePath = native.databasePath;
+    this.#publishNativeOwnershipSnapshot(active);
+  }
+
+  /** Emits `turn_started` once, after the native turn first proves it accepted this run. */
+  #acceptRun(active: OpencodeActiveRun, nativeUserMessageId?: string | null): void {
+    if (active.accepted || active.run.isTerminal) return;
+    active.accepted = true;
+    this.#markNativeConversationContextEstablished(active);
+    active.run.emit({
+      accepted: true,
+      ...(nativeUserMessageId ? { nativeUserMessageId } : {}),
+      type: 'turn_started',
+    });
+  }
+
+  #markNativeConversationContextEstablished(
+    active: OpencodeActiveRun,
+  ): void {
+    if (this.disposed || this.nativeConversationContextEstablished) return;
+    this.nativeConversationContextEstablished = true;
+    this.#publishNativeOwnershipSnapshot(active);
+  }
+
+  #publishNativeOwnershipSnapshot(active: OpencodeActiveRun): void {
+    const status = this.state.status;
+    const isCurrentExecution = (
+      this.activeRun === active
+      && !active.run.isTerminal
+      && !active.cancellationRequested
+      && !this.disposed
+      && status !== 'invalidated'
+      && status !== 'disposed'
+    );
+    if (isCurrentExecution) {
+      this.state.setStatus('executing');
+      this.#emitRunSnapshot(active);
+    } else {
+      this.state.bumpRevision();
+      this.#emitSessionSnapshot();
+    }
+  }
+
+  #isRunCurrent(
+    active: OpencodeActiveRun,
+    generation: number,
+  ): boolean {
+    return (
+      !this.disposed
+      && this.activeRun === active
+      && !active.run.isTerminal
+      && generation === this.lifecycleGeneration
+    );
+  }
+
+  async #disposeKernel(): Promise<void> {
+    if (this.kernelDisposalPromise) return this.kernelDisposalPromise;
+    for (const turn of this.backgroundScopes.values()) {
+      this.#emitBackground({ type: 'background_turn_completed', reason: 'provider-ended' }, turn);
+    }
+    this.backgroundScopes.clear();
+    if (this.backgroundTurn) {
+      this.#emitBackground({ type: 'background_turn_completed', reason: 'provider-ended' });
+      this.backgroundTurn = null;
+    }
+    const kernel = this.kernel;
+    const releaseCleanup = this.kernelRetired && !this.disposed;
+    this.kernelMetadataController.abort();
+    this.kernelRetired = false;
+    this.kernel = null;
+    this.nativeInfo = null;
+    this.kernelConfigurationKey = null;
+    this.kernelGeneration += 1;
+    if (!kernel) return;
+
+    const pending = (async () => {
+      try {
+        await kernel.dispose();
+      } catch {
+        // Kernel disposal already owns best-effort cleanup for every resource.
+      } finally {
+        if (releaseCleanup) await this.persistence.releaseClient();
+      }
+    })();
+    this.kernelDisposalPromise = pending;
+    void pending.then(() => {
+      if (this.kernelDisposalPromise === pending) {
+        this.kernelDisposalPromise = null;
+      }
+    });
+    await pending;
+  }
+
+  #emitRunSnapshot(active: OpencodeActiveRun): void {
+    active.run.emit({
+      snapshot: this.state.getSnapshot(),
+      type: 'session_state_changed',
+    });
+  }
+
+  #emitSessionSnapshot(): void {
+    this.state.emit({
+      snapshot: this.state.getSnapshot(),
+      type: 'session_state_changed',
+    });
+  }
+
+  #emitSessionError(error: Error): void {
+    this.state.emit({
+      category: 'process-exited',
+      message: error.message,
+      recoverable: true,
+      type: 'session_error',
+    });
+  }
+
+  #invalidate(
+    reason: Extract<
+      ProviderSessionInvalidationReason,
+      'cancelled' | 'process-exited' | 'provider-error' | 'provider-session-missing'
+    >,
+    recoverable: boolean,
+    error: unknown,
+  ): void {
+    this.state.invalidate({
+      message: formatError(error),
+      reason,
+      recoverable,
+    });
+  }
+}
+
+function isAcceptingLiveOutput(active: OpencodeActiveRun): boolean {
+  return active.liveOutput && !active.run.isTerminal;
+}
+
+function resolveProfile(request: ProviderExecutionRequest): OpencodeExecutionProfile {
+  if (
+    request.toolPolicy.kind === 'passive'
+    || request.toolPolicy.kind === 'allow-list'
+  ) return 'passive';
+  if (request.toolPolicy.kind === 'read-only') return 'readonly';
+  return 'managed';
+}
+
+function getInputText(request: ProviderExecutionRequest): string {
+  return request.input
+    .filter((block): block is Extract<typeof block, { type: 'text' }> => (
+      block.type === 'text'
+    ))
+    .map(({ text: value }) => value)
+    .join('\n');
+}
+
+function buildPrompt(
+  request: ProviderExecutionRequest,
+  bootstrapHistory: boolean,
+) {
+  const images = request.input
+    .filter((block): block is Extract<typeof block, { type: 'image' }> => (
+      block.type === 'image'
+    ))
+    .map(({ image }) => image);
+  return buildOpencodePrompt({
+    context: request.context,
+    images,
+    text: getInputText(request),
+  }, bootstrapHistory
+    ? [...(request.conversationHistory ?? [])] as ChatMessage[]
+    : []);
+}
+
+function formatError(error: unknown): string {
+  return error instanceof Error ? error.message : String(error);
+}

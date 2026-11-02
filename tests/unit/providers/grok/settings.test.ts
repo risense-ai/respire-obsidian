@@ -1,0 +1,375 @@
+import { readGrokCatalog, writeGrokCatalog } from '@test/helpers/providers/grokSettings';
+import { testDate } from '@test/helpers/testClock';
+
+import { getInstallationKey } from '@/core/device/InstallationKey';
+import { normalizeGrokCatalogSnapshot } from '@/providers/grok/config';
+import { grokModelPolicy } from '@/providers/grok/GrokModelPolicy';
+import {
+  getGrokProviderSettings,
+  updateGrokProviderSettings,
+} from '@/providers/grok/settings';
+import {
+  buildPersistedGrokProviderState,
+  parseGrokProviderState,
+} from '@/providers/grok/types';
+
+describe('Grok settings', () => {
+  const currentCatalog = {
+    defaultModelId: 'kimi-coding',
+    fingerprint: 'fingerprint-current',
+    models: [{
+      displayName: 'Kimi Coding',
+      rawId: 'kimi-coding',
+      reasoningEfforts: [{ label: 'High', value: 'high' }],
+      supportsReasoning: true,
+    }],
+    refreshedAt: 100,
+  };
+  const otherCatalog = {
+    defaultModelId: 'glm-coding',
+    fingerprint: 'fingerprint-other',
+    models: [{
+      displayName: 'GLM Coding',
+      rawId: 'glm-coding',
+      reasoningEfforts: [],
+      supportsReasoning: false,
+    }],
+    refreshedAt: 50,
+  };
+
+  beforeEach(() => {
+    vi.clearAllMocks();
+  });
+
+  it('preserves hostname-scoped state without assigning it to the current device', () => {
+    const settings = getGrokProviderSettings({
+      providerConfigs: {
+        grok: {
+          catalogsByHost: {
+            'legacy-host': currentCatalog,
+            'other-host': otherCatalog,
+          },
+          cliPathsByHost: {
+            'legacy-host': '/legacy/grok',
+            'other-host': '/other/grok',
+          },
+        },
+      },
+    });
+
+    expect(settings.cliPathsByHost).toEqual({
+      'legacy-host': '/legacy/grok',
+      'other-host': '/other/grok',
+    });
+    expect(settings.catalogsByHost).toEqual({
+      'legacy-host': currentCatalog,
+      'other-host': otherCatalog,
+    });
+    expect(settings.currentCatalog).toBeNull();
+  });
+
+  it('rejects arrays and filters mixed hostname CLI maps', () => {
+    expect(getGrokProviderSettings({
+      providerConfigs: {
+        grok: {
+          cliPathsByHost: ['/array/grok'],
+        },
+      },
+    }).cliPathsByHost).toEqual({});
+    expect(getGrokProviderSettings({
+      providerConfigs: {
+        grok: {
+          cliPathsByHost: {
+            [` ${getInstallationKey()} `]: ' /current/grok ',
+            invalid: 42,
+          },
+        },
+      },
+    }).cliPathsByHost).toEqual({ [getInstallationKey()]: '/current/grok' });
+  });
+
+  it('round-trips only the current host catalog without changing other hosts', () => {
+    const settings: Record<string, unknown> = {
+      providerConfigs: {
+        grok: {
+          catalogsByHost: {
+            [getInstallationKey()]: currentCatalog,
+            'other-host': otherCatalog,
+          },
+        },
+      },
+    };
+    const replacement = {
+      ...currentCatalog,
+      fingerprint: 'replacement',
+      refreshedAt: 200,
+    };
+
+    expect(writeGrokCatalog(settings, replacement)).toEqual(replacement);
+    expect(readGrokCatalog(settings)).toEqual(replacement);
+    expect(getGrokProviderSettings(settings).catalogsByHost['other-host']).toEqual(otherCatalog);
+  });
+
+  it('whitelists catalog metadata and never persists opaque or secret fields', () => {
+    const snapshot = normalizeGrokCatalogSnapshot({
+      apiKey: 'catalog-secret',
+      defaultModelId: 'kimi-coding',
+      fingerprint: 'names-only-fingerprint',
+      models: [{
+        accessToken: 'model-secret',
+        displayName: 'Kimi Coding',
+        rawId: 'kimi-coding',
+      }],
+      refreshedAt: 123,
+    });
+
+    expect(snapshot).toEqual({
+      defaultModelId: 'kimi-coding',
+      fingerprint: 'names-only-fingerprint',
+      models: [{
+        displayName: 'Kimi Coding',
+        rawId: 'kimi-coding',
+        reasoningEfforts: [],
+        supportsReasoning: false,
+      }],
+      refreshedAt: 123,
+    });
+    expect(JSON.stringify(snapshot)).not.toContain('secret');
+  });
+
+  it('round-trips future provider-advertised effort metadata and preferences', () => {
+    const settings: Record<string, unknown> = {
+      providerConfigs: {
+        grok: {
+          catalogsByHost: {
+            [getInstallationKey()]: {
+              defaultModelId: 'grok-future',
+              fingerprint: 'future-catalog',
+              models: [{
+                defaultReasoningEffort: 'max',
+                displayName: 'Grok Future',
+                rawId: 'grok-future',
+                reasoningEfforts: [
+                  { label: 'High', value: 'high' },
+                  { label: 'Maximum', value: 'max' },
+                ],
+                reasoningMetadataResolved: true,
+                supportsReasoning: true,
+              }],
+              refreshedAt: 123,
+            },
+          },
+          preferredReasoningByModel: { 'grok-future': 'max' },
+          visibleModels: ['grok-future'],
+        },
+      },
+    };
+
+    const grok = getGrokProviderSettings(settings);
+    expect(grok.currentCatalog?.models[0]).toEqual(expect.objectContaining({
+      defaultReasoningEffort: 'max',
+      reasoningEfforts: expect.arrayContaining([
+        expect.objectContaining({ value: 'max' }),
+      ]),
+      reasoningMetadataResolved: true,
+    }));
+    expect(grok.preferredReasoningByModel).toEqual({ 'grok-future': 'max' });
+  });
+
+  it('normalizes catalog-scoped preferences while retaining a selected stale model', () => {
+    const settings = getGrokProviderSettings({
+      model: 'grok/legacy-model',
+      providerConfigs: {
+        grok: {
+          catalogsByHost: { [getInstallationKey()]: currentCatalog },
+          modelAliases: {
+            ' kimi-coding ': ' Kimi ',
+            'legacy-model': ' Legacy ',
+            unknown: 'Drop me',
+          },
+          preferredReasoningByModel: {
+            'kimi-coding': 'medium',
+            'legacy-model': 'low',
+            unknown: 'xhigh',
+          },
+          visibleModels: [
+            'kimi-coding',
+            'kimi-coding',
+            'legacy-model',
+            'unknown',
+          ],
+        },
+      },
+    });
+
+    expect(settings.visibleModels).toEqual(['kimi-coding', 'legacy-model', 'unknown']);
+    expect(settings.modelAliases).toEqual({
+      'kimi-coding': 'Kimi',
+      'legacy-model': 'Legacy', unknown: 'Drop me',
+    });
+    expect(settings.preferredReasoningByModel).toEqual({
+      'kimi-coding': 'medium',
+      'legacy-model': 'low',
+      unknown: 'xhigh',
+    });
+  });
+
+  it('persists normalized settings without clobbering unrelated providers', () => {
+    const settings: Record<string, unknown> = {
+      providerConfigs: {
+        codex: { enabled: true },
+        grok: { catalogsByHost: { [getInstallationKey()]: currentCatalog } },
+      },
+    };
+
+    const next = updateGrokProviderSettings(settings, {
+      cliPath: ' /opt/bin/grok ',
+      enabled: true,
+      modelAliases: { 'kimi-coding': ' Kimi ' },
+      visibleModels: ['kimi-coding'],
+    });
+
+    expect(next).toMatchObject({
+      cliPath: '',
+      cliPathsByHost: { [getInstallationKey()]: '/opt/bin/grok' },
+      enabled: true,
+      modelAliases: { 'kimi-coding': 'Kimi' },
+      visibleModels: ['kimi-coding'],
+    });
+    expect((settings.providerConfigs as Record<string, unknown>).codex).toEqual({ enabled: true });
+  });
+
+  it('prunes disabled preferences while retaining discovered capabilities in memory', () => {
+    const settings: Record<string, unknown> = {
+      providerConfigs: {
+        grok: {
+          catalogsByHost: {
+            [getInstallationKey()]: {
+              ...currentCatalog,
+              models: currentCatalog.models.map(model => ({
+                ...model,
+                reasoningMetadataResolved: true,
+              })),
+            },
+            'device:other': {
+              ...otherCatalog,
+              models: otherCatalog.models.map(model => ({
+                ...model,
+                reasoningEfforts: [{ label: 'High', value: 'high' }],
+                reasoningMetadataResolved: true,
+                supportsReasoning: true,
+              })),
+            },
+          },
+          preferredReasoningByModel: { 'kimi-coding': 'high' },
+          visibleModels: ['kimi-coding'],
+        },
+      },
+    };
+
+    updateGrokProviderSettings(settings, { visibleModels: [] });
+
+    const grok = getGrokProviderSettings(settings);
+    expect(grok.preferredReasoningByModel).toEqual({});
+    for (const catalogSnapshot of Object.values(grok.catalogsByHost)) {
+      for (const model of catalogSnapshot.models) {
+        expect(model.reasoningEfforts).toEqual([{ label: 'High', value: 'high' }]);
+        expect(model.supportsReasoning).toBe(true);
+        expect(model.reasoningMetadataResolved).toBe(true);
+      }
+    }
+  });
+});
+
+describe('Grok provider state', () => {
+  it('preserves the provider-owned native-context handoff marker', () => {
+    expect(parseGrokProviderState({
+      nativeConversationContextEstablished: false,
+    })).toEqual({
+      nativeConversationContextEstablished: false,
+    });
+    expect(buildPersistedGrokProviderState({
+      nativeConversationContextEstablished: true,
+    })).toEqual({
+      nativeConversationContextEstablished: true,
+    });
+  });
+
+  it('parses and builds only an absolute native session directory hint', () => {
+    expect(parseGrokProviderState({
+      sessionDirectory: ' /tmp/.grok/sessions/vault/session-id ',
+      token: 'do-not-preserve',
+    })).toEqual({
+      sessionDirectory: '/tmp/.grok/sessions/vault/session-id',
+    });
+    expect(parseGrokProviderState({ sessionDirectory: '../outside' })).toEqual({});
+    expect(buildPersistedGrokProviderState({ sessionDirectory: '/tmp/.grok/sessions/vault/session-id' })).toEqual({
+      sessionDirectory: '/tmp/.grok/sessions/vault/session-id',
+    });
+    expect(buildPersistedGrokProviderState({ sessionDirectory: '../outside' })).toBeUndefined();
+  });
+
+  it('sanitizes and persists pending native fork state without unrelated fields', () => {
+    expect(parseGrokProviderState({
+      forkSource: { resumeAt: ' assistant-1 ', sessionId: ' source-session ' },
+      forkSourceSessionDirectory: ' /tmp/.grok/sessions/vault/source-session ',
+      token: 'do-not-preserve',
+    })).toEqual({
+      forkSource: { resumeAt: 'assistant-1', sessionId: 'source-session' },
+      forkSourceSessionDirectory: '/tmp/.grok/sessions/vault/source-session',
+    });
+    expect(buildPersistedGrokProviderState({
+      forkSource: { resumeAt: 'assistant-1', sessionId: 'source-session' },
+      forkSourceSessionDirectory: '/tmp/.grok/sessions/vault/source-session',
+    })).toEqual({
+      forkSource: { resumeAt: 'assistant-1', sessionId: 'source-session' },
+      forkSourceSessionDirectory: '/tmp/.grok/sessions/vault/source-session',
+    });
+    expect(parseGrokProviderState({
+      forkSource: { resumeAt: '', sessionId: 'source-session' },
+      forkSourceSessionDirectory: '../outside',
+    })).toEqual({});
+  });
+});
+
+it('round-trips own prototype-named model metadata through the provider configuration', () => {
+  const settings: Record<string, unknown> = {};
+  const modelAliases = JSON.parse('{"__proto__":"Gateway alias"}') as Record<string, string>;
+  const preferredReasoningByModel = JSON.parse('{"__proto__":"high"}') as Record<string, string>;
+  updateGrokProviderSettings(settings, { visibleModels: ['__proto__'], modelAliases, preferredReasoningByModel });
+  const reloaded = getGrokProviderSettings(JSON.parse(JSON.stringify(settings)));
+  expect(Object.entries(reloaded.modelAliases)).toEqual([['__proto__', 'Gateway alias']]);
+  expect(Object.entries(reloaded.preferredReasoningByModel)).toEqual([['__proto__', 'high']]);
+});
+
+it.each(['constructor', 'toString', '__proto__'])('keeps the native Grok label when %s has no own alias', id => {
+  const settings: Record<string, unknown> = {};
+  updateGrokProviderSettings(settings, { visibleModels: [id] });
+  writeGrokCatalog(settings, { fingerprint: 'prototype-id', refreshedAt: testDate().getTime(), defaultModelId: id,
+    models: [{ rawId: id, displayName: 'Gateway model', supportsReasoning: false, reasoningEfforts: [] }] });
+  expect(grokModelPolicy.getModelOptions(settings)).toEqual([expect.objectContaining({ label: 'Gateway model' })]);
+  expect(typeof grokModelPolicy.getDefaultReasoningValue?.('grok/' + id, settings)).toBe('string');
+});
+
+it('persists the first explicit reasoning choice for a prototype-named Grok model', () => {
+  const settings: Record<string, unknown> = {};
+  updateGrokProviderSettings(settings, { visibleModels: ['__proto__'] });
+  writeGrokCatalog(settings, { fingerprint: 'prototype-id', refreshedAt: testDate().getTime(), defaultModelId: '__proto__', models: [
+    { rawId: '__proto__', displayName: 'Gateway model', supportsReasoning: true, reasoningEfforts: [{ label: 'High', value: 'high' }], reasoningMetadataResolved: true },
+  ] });
+  grokModelPolicy.applyReasoningSelection?.('grok/__proto__', 'high', settings);
+  expect(Object.entries(getGrokProviderSettings(JSON.parse(JSON.stringify(settings))).preferredReasoningByModel)).toEqual([['__proto__', 'high']]);
+});
+
+it('preserves the native model description without creating a synthetic fallback', () => {
+  const settings: Record<string, unknown> = {};
+  updateGrokProviderSettings(settings, { visibleModels: ['constructor', 'toString'] });
+  writeGrokCatalog(settings, { fingerprint: 'description-preservation', refreshedAt: testDate().getTime(), defaultModelId: 'constructor', models: [
+    { rawId: 'constructor', displayName: 'Without description', supportsReasoning: false, reasoningEfforts: [] },
+    { rawId: 'toString', displayName: 'With description', description: 'Native description', supportsReasoning: false, reasoningEfforts: [] },
+  ] });
+  const options = grokModelPolicy.getModelOptions(settings);
+  expect(options[0]).toMatchObject({ label: 'Without description' });
+  expect(Object.hasOwn(options[0], 'description')).toBe(false);
+  expect(options[1]).toMatchObject({ label: 'With description', description: 'Native description' });
+});

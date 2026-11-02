@@ -1,0 +1,237 @@
+import '@/providers';
+
+import { ProviderSettingsCoordinator } from '@/core/providers/ProviderSettingsCoordinator';
+import { normalizePiVisibleModels } from '@/providers/pi/config';
+import { piSettingsReconciler } from '@/providers/pi/env/PiSettingsReconciler';
+import {
+  getPiProviderSettings,
+  updatePiProviderSettings
+} from '@/providers/pi/settings';
+
+describe('Pi settings normalization', () => {
+  const discoveredModels = [
+    {
+      encodedId: 'pi:anthropic/claude-sonnet-4',
+      id: 'claude-sonnet-4',
+      input: ['text' as const],
+      label: 'Claude Sonnet 4',
+      provider: 'anthropic',
+      reasoning: true,
+      thinkingLevels: ['off' as const, 'medium' as const, 'high' as const],
+    },
+    {
+      encodedId: 'pi:openai/gpt-5',
+      id: 'gpt-5',
+      input: ['text' as const, 'image' as const],
+      label: 'GPT-5',
+      provider: 'openai',
+      reasoning: true,
+      thinkingLevels: ['off' as const, 'low' as const, 'medium' as const],
+    },
+  ];
+
+  beforeEach(() => {
+    vi.clearAllMocks();
+  });
+
+  it('preserves hostname-scoped CLI paths without assigning them to the current device', () => {
+
+    expect(getPiProviderSettings({
+      providerConfigs: {
+        pi: {
+          cliPathsByHost: {
+            'host-a': '/host-a/pi',
+            'host-b': '/host-b/pi',
+          },
+        },
+      },
+    }).cliPathsByHost).toEqual({
+      'host-a': '/host-a/pi',
+      'host-b': '/host-b/pi',
+    });
+  });
+
+  it('rejects arrays and filters mixed hostname CLI maps', () => {
+    expect(getPiProviderSettings({
+      providerConfigs: { pi: { cliPathsByHost: ['/array/pi'] } },
+    }).cliPathsByHost).toEqual({});
+    expect(getPiProviderSettings({
+      providerConfigs: {
+        pi: {
+          cliPathsByHost: { ' host-a ': ' /host-a/pi ', invalid: null },
+        },
+      },
+    }).cliPathsByHost).toEqual({ 'host-a': '/host-a/pi' });
+  });
+
+  it('normalizes visible models to valid encoded ids', () => {
+    expect(normalizePiVisibleModels([
+      'pi:anthropic/claude-sonnet-4',
+      'pi:anthropic/claude-sonnet-4',
+      'pi:missing/model',
+      'openai/gpt-5',
+    ])).toEqual(['pi:anthropic/claude-sonnet-4', 'pi:missing/model']);
+  });
+
+  it('normalizes aliases and defaults unsupported preferred thinking to High', () => {
+    const settings = getPiProviderSettings({
+      providerConfigs: {
+        pi: {
+          discoveredModels: [
+            ...discoveredModels,
+            {
+              encodedId: 'pi:anthropic/claude-opus-4-7',
+              id: 'claude-opus-4-7',
+              input: ['text'],
+              label: 'Claude Opus 4.7',
+              provider: 'anthropic',
+              reasoning: true,
+              thinkingLevels: ['off', 'low', 'medium', 'high', 'xhigh'],
+            },
+          ],
+          modelAliases: {
+            'pi:anthropic/claude-sonnet-4': '  Sonnet  ',
+            'pi:missing/model': 'Missing',
+          },
+          preferredThinkingByModel: {
+            'pi:anthropic/claude-opus-4-7': 'max',
+            'pi:anthropic/claude-sonnet-4': 'max',
+            'pi:openai/gpt-5': 'xhigh',
+          },
+        },
+      },
+    });
+
+    expect(settings.modelAliases).toEqual({
+      'pi:anthropic/claude-sonnet-4': 'Sonnet',
+    });
+    expect(settings.preferredThinkingByModel).toEqual({
+      'pi:anthropic/claude-opus-4-7': 'high',
+      'pi:anthropic/claude-sonnet-4': 'high',
+      'pi:openai/gpt-5': 'high',
+    });
+  });
+
+  it('keeps selected model metadata even when the selected model is no longer discovered', () => {
+    const settings: Record<string, unknown> = {
+      model: 'pi:old-provider/old-model',
+      providerConfigs: {
+        pi: {
+          discoveredModels,
+          modelAliases: {
+            'pi:old-provider/old-model': 'Legacy model',
+            'pi:missing/model': 'Missing',
+          },
+          preferredThinkingByModel: {
+            'pi:old-provider/old-model': 'high',
+            'pi:missing/model': 'low',
+          },
+          visibleModels: ['pi:anthropic/claude-sonnet-4'],
+        },
+      },
+      savedProviderModel: {},
+      titleGenerationModel: '',
+    };
+
+    expect(getPiProviderSettings(settings).modelAliases).toEqual({
+      'pi:old-provider/old-model': 'Legacy model',
+    });
+    expect(getPiProviderSettings(settings).preferredThinkingByModel).toEqual({
+      'pi:old-provider/old-model': 'high',
+    });
+  });
+
+  it('preserves selected model metadata during model variant reconciliation when discovery is stale', () => {
+    const settings: Record<string, unknown> = {
+      model: 'pi:old-provider/old-model',
+      providerConfigs: {
+        pi: {
+          discoveredModels,
+          modelAliases: {
+            'pi:old-provider/old-model': 'Legacy model',
+          },
+          preferredThinkingByModel: {
+            'pi:old-provider/old-model': 'high',
+          },
+          visibleModels: ['pi:anthropic/claude-sonnet-4'],
+        },
+      },
+      savedProviderModel: {},
+      titleGenerationModel: '',
+    };
+
+    expect(piSettingsReconciler.normalizeModelVariantSettings(settings)).toBe(false);
+    expect(getPiProviderSettings(settings).modelAliases).toEqual({
+      'pi:old-provider/old-model': 'Legacy model',
+    });
+    expect(getPiProviderSettings(settings).preferredThinkingByModel).toEqual({
+      'pi:old-provider/old-model': 'high',
+    });
+  });
+
+  it('preserves active and saved Pi selections when visible models change', () => {
+    const settings: Record<string, unknown> = {
+      effortLevel: 'high',
+      model: 'pi:openai/gpt-5',
+      providerConfigs: {
+        pi: {
+          discoveredModels,
+          preferredThinkingByModel: {
+            'pi:anthropic/claude-sonnet-4': 'high',
+          },
+          visibleModels: ['pi:openai/gpt-5', 'pi:anthropic/claude-sonnet-4'],
+        },
+      },
+      savedProviderEffort: {
+        pi: 'medium',
+      },
+      savedProviderModel: {
+        pi: 'pi:openai/gpt-5',
+      },
+      titleGenerationModel: 'pi:openai/gpt-5',
+    };
+
+    updatePiProviderSettings(settings, {
+      visibleModels: ['pi:anthropic/claude-sonnet-4'],
+    });
+
+    expect(settings.model).toBe('pi:openai/gpt-5');
+    expect(settings.effortLevel).toBe('high');
+    expect((settings.savedProviderModel as Record<string, string>).pi).toBe('pi:openai/gpt-5');
+    expect((settings.savedProviderEffort as Record<string, string>).pi).toBe('medium');
+    expect(settings.titleGenerationModel).toBe('pi:openai/gpt-5');
+  });
+
+  it('preserves the Pi title model when all visible models are removed', () => {
+    const settings: Record<string, unknown> = {
+      providerConfigs: {
+        pi: {
+          discoveredModels,
+          visibleModels: ['pi:openai/gpt-5'],
+        },
+      },
+      titleGenerationModel: 'pi:openai/gpt-5',
+    };
+
+    updatePiProviderSettings(settings, { visibleModels: [] });
+
+    expect(settings.titleGenerationModel).toBe('pi:openai/gpt-5');
+  });
+
+  it('retains stale discovery metadata on environment change without dropping visible model choices', () => {
+    const settings: Record<string, unknown> = {
+      providerConfigs: {
+        pi: {
+          discoveredModels,
+          visibleModels: ['pi:anthropic/claude-sonnet-4'],
+        },
+      },
+    };
+
+    expect(ProviderSettingsCoordinator.handleEnvironmentChange(settings, ['pi'])).toBe(false);
+
+    expect(getPiProviderSettings(settings).discoveredModels).toEqual(discoveredModels);
+    expect(getPiProviderSettings(settings).visibleModels).toEqual(['pi:anthropic/claude-sonnet-4']);
+  });
+
+});

@@ -1,0 +1,46 @@
+import type { App, Component } from 'obsidian';
+import { MarkdownRenderer } from 'obsidian';
+
+import { processFileLinks } from '@/utils/fileLink';
+import { replaceImageEmbedsWithHTML } from '@/utils/imageEmbed';
+import { normalizeLatexMathDelimiters } from '@/utils/markdownMath';
+
+interface RenderInlineEditMarkdownPreviewOptions {
+  app: App;
+  component: Component;
+  container: HTMLElement;
+  markdown: string;
+  sourcePath: string;
+  mediaFolder?: string;
+}
+
+function appendFallback(container: HTMLElement, markdown: string): void {
+  container.createDiv({ cls: 'claudian-inline-markdown-fallback', text: markdown });
+}
+
+export async function renderInlineEditMarkdownPreview({
+  app,
+  component,
+  container,
+  markdown,
+  sourcePath,
+  mediaFolder = '',
+}: RenderInlineEditMarkdownPreviewOptions): Promise<void> {
+  container.replaceChildren();
+
+  try {
+    const normalizedMarkdown = normalizeLatexMathDelimiters(markdown);
+    const processedMarkdown = replaceImageEmbedsWithHTML(normalizedMarkdown, app, {
+      mediaFolder,
+      sourcePath,
+    });
+    await MarkdownRenderer.render(app, processedMarkdown, container, sourcePath, component);
+
+    if (processedMarkdown.includes('[[') && app.metadataCache) {
+      processFileLinks(app, container, sourcePath);
+    }
+  } catch {
+    container.replaceChildren();
+    appendFallback(container, markdown);
+  }
+}

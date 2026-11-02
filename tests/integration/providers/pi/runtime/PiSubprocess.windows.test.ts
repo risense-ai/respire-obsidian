@@ -1,0 +1,153 @@
+import * as fs from 'node:fs/promises';
+import * as os from 'node:os';
+import * as path from 'node:path';
+
+import { createPiCommandShim } from '@test/helpers/providers/pi/PiWindowsLaunchers';
+
+import { findNodeExecutable, getEnhancedPath } from '@/core/process/env';
+import { PiSubprocess } from '@/providers/pi/runtime/PiSubprocess';
+
+const describeOnWindows = process.platform === 'win32' ? describe : describe.skip;
+
+const PI_PACKAGE_PATH = ['node_modules', '@earendil-works', 'pi-coding-agent'];
+
+interface PiLaunchFixture {
+  cliPath: string;
+  commandPath: string;
+}
+
+describeOnWindows('PiSubprocess Windows argv integration', () => {
+  it.each([
+    ['npm command shim', writeNpmShimFixture],
+    ['pi.dev managed pi.cmd launcher', (root: string) => writeManagedFixture(root, 'pi.cmd')],
+    ['pi.dev managed pi.ps1 launcher', (root: string) => writeManagedFixture(root, 'pi.ps1')],
+  ])('preserves opaque arguments after bypassing the %s', async (_layout, writeFixture) => {
+    const root = await fs.mkdtemp(path.join(os.tmpdir(), 'pi-argv-integration-'));
+    const expectedArgs = [
+      '--mode',
+      'rpc',
+      '--system-prompt',
+      'First line\r\nSecond line with "%PATH%" and !caret^',
+      '--session',
+      'D:\\文档\\Pi Sessions\\session.jsonl',
+    ];
+    let subprocess: PiSubprocess | null = null;
+
+    try {
+      const { cliPath, commandPath } = await writeFixture(root);
+
+      subprocess = new PiSubprocess({
+        args: expectedArgs,
+        command: commandPath,
+        cwd: root,
+        env: { ...process.env },
+      });
+      subprocess.start();
+
+      await expect(readFirstLine(subprocess, {
+        fixture: cliPath,
+        node: findNodeExecutable(getEnhancedPath(process.env.PATH, commandPath)),
+        runner: process.execPath,
+      })).resolves.toEqual(expectedArgs);
+    } finally {
+      await subprocess?.shutdown();
+      await fs.rm(root, { force: true, recursive: true });
+    }
+  }, 45_000);
+});
+
+async function writeNpmShimFixture(npmPrefix: string): Promise<PiLaunchFixture> {
+  const cliPath = await writeArgvPiPackage(path.join(npmPrefix, ...PI_PACKAGE_PATH));
+  const commandPath = path.join(npmPrefix, 'pi.cmd');
+  await fs.writeFile(commandPath, createPiCommandShim(commandPath, cliPath));
+  return { cliPath, commandPath };
+}
+
+async function writeManagedFixture(
+  agentRoot: string,
+  launcher: 'pi.cmd' | 'pi.ps1',
+): Promise<PiLaunchFixture> {
+  const version = '1.1.0';
+  const binDir = path.join(agentRoot, 'bin');
+  const installRoot = path.join(agentRoot, 'install');
+  const cliPath = await writeArgvPiPackage(
+    path.join(installRoot, 'releases', version, ...PI_PACKAGE_PATH),
+  );
+  await fs.writeFile(path.join(installRoot, 'managed-install.json'), JSON.stringify({
+    kind: 'pi-managed-install',
+    layout: 'releases-v1',
+    schemaVersion: 1,
+  }));
+  await fs.writeFile(path.join(installRoot, 'current-version'), `${version}\n`);
+  await fs.mkdir(binDir, { recursive: true });
+  // Output that cannot match the expected argv if the launcher runs instead.
+  await fs.writeFile(
+    path.join(binDir, 'pi-launcher.js'),
+    'process.stdout.write(`${JSON.stringify(["launcher"])}\\n`);\n',
+  );
+  await fs.writeFile(
+    path.join(binDir, 'pi.cmd'),
+    '@ECHO off\r\nnode "%~dp0pi-launcher.js" %*\r\n',
+  );
+  await fs.writeFile(path.join(binDir, 'pi.ps1'), [
+    '#!/usr/bin/env pwsh',
+    '$basedir = Split-Path $MyInvocation.MyCommand.Definition -Parent',
+    '$launcher = Join-Path $basedir "pi-launcher.js"',
+    'if ($MyInvocation.ExpectingInput) { $input | & node $launcher $args }',
+    'else { & node $launcher $args }',
+    'exit $LASTEXITCODE',
+    '',
+  ].join('\r\n'));
+  return { cliPath, commandPath: path.join(binDir, launcher) };
+}
+
+async function writeArgvPiPackage(packageRoot: string): Promise<string> {
+  const cliPath = path.join(packageRoot, 'dist', 'bundle', 'cli.js');
+  await fs.mkdir(path.dirname(cliPath), { recursive: true });
+  await fs.writeFile(path.join(packageRoot, 'package.json'), JSON.stringify({
+    bin: { pi: 'dist/bundle/cli.js' },
+    name: '@earendil-works/pi-coding-agent',
+  }));
+  await fs.writeFile(cliPath, [
+    'process.stdout.write(`${JSON.stringify(process.argv.slice(2))}\\n`);',
+    'process.stdin.resume();',
+  ].join('\n'));
+  return cliPath;
+}
+
+function readFirstLine(subprocess: PiSubprocess, launch: Record<string, unknown>): Promise<unknown> {
+  return new Promise((resolve, reject) => {
+    let buffered = '';
+    // Allow for slow Node startup on hosted Windows runners.
+    const timeout = window.setTimeout(() => {
+      cleanup();
+      reject(new Error(`Timed out waiting for the Pi argv fixture: ${JSON.stringify({
+        ...launch,
+        alive: subprocess.isAlive(),
+        stdout: buffered,
+        stderr: subprocess.getStderrSnapshot(),
+      })}`));
+    }, 30_000);
+    const onData = (chunk: Buffer | string): void => {
+      buffered += chunk.toString();
+      const newlineIndex = buffered.indexOf('\n');
+      if (newlineIndex < 0) return;
+      cleanup();
+      try {
+        resolve(JSON.parse(buffered.slice(0, newlineIndex)) as unknown);
+      } catch (error) {
+        reject(error);
+      }
+    };
+    const removeCloseListener = subprocess.onClose(error => {
+      cleanup();
+      reject(error ?? new Error('Pi argv fixture exited before producing output'));
+    });
+    const cleanup = (): void => {
+      window.clearTimeout(timeout);
+      subprocess.stdout.off('data', onData);
+      removeCloseListener();
+    };
+    subprocess.stdout.on('data', onData);
+  });
+}
